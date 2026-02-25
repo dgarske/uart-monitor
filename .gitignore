@@ -1,0 +1,6 @@
+build/
+uart-monitor
+tests/test_serial
+tests/test_monitor
+tests/test_identify
+*.o

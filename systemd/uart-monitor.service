@@ -1,0 +1,18 @@
+[Unit]
+Description=UART Monitor Daemon - Background serial port logger
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/uart-monitor monitor --systemd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=3
+KillMode=process
+Environment="HOME=%h"
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=default.target
