@@ -203,6 +203,48 @@ The `sd_notify` protocol is implemented directly (~20 lines of C sending a
 datagram to `$NOTIFY_SOCKET`). No `libsystemd` linkage is needed. The binary
 is fully self-contained.
 
+## Concurrent Access / Port Sharing
+
+The monitor opens ports `O_RDONLY` and does **not** set `TIOCEXCL`, so other
+processes can still `open()` the same device. However, the Linux tty layer has
+a single input buffer per port -- **bytes read by one process are consumed and
+unavailable to any other reader**. This means:
+
+| Other process does... | Works? | Notes |
+|-----------------------|--------|-------|
+| Write-only (flash tool sending firmware) | Yes | Monitor keeps reading output |
+| Read+write (picocom, minicom, screen) | **No** | Both compete for incoming bytes |
+| Read responses (flash ACK/NACK) | **No** | Monitor may steal response bytes |
+
+**Current workflow**: use `uart-monitor yield /dev/ttyUSBx` before running any
+tool that needs to read from the port, then `uart-monitor reclaim` afterward.
+
+## Future TODO
+
+- [ ] **PTY proxy mode** (`uart-monitor monitor --proxy`): Instead of opening
+  the real port read-only, open it `O_RDWR`, create a pseudo-terminal pair via
+  `openpty()`, and expose the slave PTY as
+  `/tmp/uart-monitor/pty/ttyUSB0`. Forward data bidirectionally (real port
+  <-> PTY) while logging all traffic. This would allow the AI (or any tool)
+  to both read and write through the proxy path without needing yield/reclaim.
+  Flash tools would use the PTY path instead of the real device path.
+
+- [ ] **Auto-yield via fuser**: Poll `fuser /dev/ttyUSBx` every few seconds to
+  detect when another process opens the port. Auto-yield when a foreign PID is
+  detected, auto-reclaim when it exits (with a grace period).
+
+- [ ] **Save board config** (`uart-monitor identify --save`): Port the Python
+  `save_config()` to C so the identify command can write `~/.boards` natively.
+
+- [ ] **Per-port symlinks in session dir**: Create human-friendly symlinks like
+  `polarfire-uart0.log -> ttyUSB0.log` inside the session directory.
+
+- [ ] **ANSI escape stripping** (`--strip-ansi`): Remove terminal escape
+  sequences from log files for cleaner grep/search.
+
+- [ ] **Configurable exclude list**: Skip specific ports (e.g. USB relay
+  controllers that use binary protocols) via a config file or `--exclude` flag.
+
 ## Building
 
 ```bash
