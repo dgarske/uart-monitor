@@ -2,11 +2,14 @@
  *
  * Single-threaded event loop multiplexing:
  *   - Serial port reads (one per monitored device)
+ *   - PTY master reads (proxy mode: user writing to virtual port)
  *   - Netlink/inotify hot-plug events
  *   - Unix domain socket control commands
  *   - signalfd for SIGTERM/SIGINT/SIGHUP
  *
- * NEVER writes to serial ports.
+ * In read-only mode: opens ports O_RDONLY, never writes.
+ * In proxy mode (--proxy): opens ports O_RDWR, creates PTY pairs,
+ *   forwards bidirectionally, sets TIOCEXCL on the real port.
  */
 #include "monitor.h"
 #include "hotplug.h"
@@ -22,11 +25,12 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_EPOLL_EVENTS  (MAX_PORTS + 16)
+#define MAX_EPOLL_EVENTS  (MAX_PORTS * 2 + 16)
 #define READ_BUF_SIZE     4096
 #define PID_FILE          LOG_BASE_DIR "/uart-monitor.pid"
 #define STATUS_FILE       LOG_BASE_DIR "/status.json"
@@ -104,6 +108,28 @@ pidfile_remove(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  PTY symlink management                                            */
+/* ------------------------------------------------------------------ */
+
+static void
+pty_create_symlink(const char *label, const char *pty_path)
+{
+    mkdirp(PTY_DIR);
+
+    char link[512];
+    snprintf(link, sizeof(link), "%s/%s", PTY_DIR, label);
+    symlink_update(pty_path, link);
+}
+
+static void
+pty_remove_symlink(const char *label)
+{
+    char link[512];
+    snprintf(link, sizeof(link), "%s/%s", PTY_DIR, label);
+    unlink(link);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Status JSON                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -124,6 +150,8 @@ write_status_json(monitor_state_t *state)
     fprintf(fp, "{\n");
     fprintf(fp, "  \"pid\": %d,\n", getpid());
     fprintf(fp, "  \"session\": \"%s\",\n", session_name);
+    fprintf(fp, "  \"proxy_mode\": %s,\n",
+            state->proxy_mode ? "true" : "false");
     fprintf(fp, "  \"port_count\": %d,\n", state->port_count);
     fprintf(fp, "  \"ports\": [\n");
 
@@ -148,6 +176,12 @@ write_status_json(monitor_state_t *state)
         fprintf(fp, "      \"status\": \"%s\",\n",
                 mp->yielded ? "yielded" : "monitoring");
         fprintf(fp, "      \"log_file\": \"%s\",\n", mp->log.filepath);
+        if (mp->serial.pty_master >= 0) {
+            fprintf(fp, "      \"pty_device\": \"%s/%s\",\n",
+                    PTY_DIR, mp->identity.label);
+            fprintf(fp, "      \"pty_slave\": \"%s\",\n",
+                    mp->serial.pty_path);
+        }
         fprintf(fp, "      \"bytes_logged\": %zu\n", mp->log.bytes_written);
         fprintf(fp, "    }%s\n",
                 (i < state->port_count - 1) ? "," : "");
@@ -210,12 +244,18 @@ add_port(monitor_state_t *state, tty_port_t *identity)
     memset(mp, 0, sizeof(*mp));
     mp->identity = *identity;
     mp->serial.fd = -1;
+    mp->serial.pty_master = -1;
 
-    /* open serial port */
-    if (serial_open(&mp->serial, identity->dev_path,
-                    state->baudrate) < 0) {
+    /* open serial port (proxy or read-only) */
+    int rc;
+    if (state->proxy_mode)
+        rc = serial_open_proxy(&mp->serial, identity->dev_path,
+                               state->baudrate);
+    else
+        rc = serial_open(&mp->serial, identity->dev_path, state->baudrate);
+
+    if (rc < 0)
         return -1;
-    }
 
     /* build log header */
     char header[512];
@@ -234,14 +274,28 @@ add_port(monitor_state_t *state, tty_port_t *identity)
              identity->function_name ? identity->function_name : "Unknown",
              115200);
 
-    /* open log file */
+    /* open log file -- use label as filename for human-friendly names */
     if (log_open(&mp->log, state->session_path,
-                 identity->tty_name, header) < 0) {
+                 identity->label, header) < 0) {
         serial_close(&mp->serial);
         return -1;
     }
 
-    /* add to epoll */
+    /* create a tty_name.log -> label.log symlink for compatibility */
+    if (strcmp(identity->tty_name, identity->label) != 0) {
+        char link_path[768];
+        char label_log[128];
+        snprintf(link_path, sizeof(link_path),
+                 "%s/%s.log", state->session_path, identity->tty_name);
+        snprintf(label_log, sizeof(label_log), "%s.log", identity->label);
+        /* only create symlink if it doesn't already exist */
+        if (access(link_path, F_OK) != 0) {
+            int sret = symlink(label_log, link_path);
+            (void)sret;
+        }
+    }
+
+    /* add serial fd to epoll */
     mp->evt.type = EVT_SERIAL;
     mp->evt.index = idx;
     mp->evt.fd = mp->serial.fd;
@@ -258,9 +312,36 @@ add_port(monitor_state_t *state, tty_port_t *identity)
         return -1;
     }
 
+    /* if proxy mode, also add PTY master to epoll */
+    if (mp->serial.pty_master >= 0) {
+        mp->evt_pty.type = EVT_PTY;
+        mp->evt_pty.index = idx;
+        mp->evt_pty.fd = mp->serial.pty_master;
+
+        ev.events = EPOLLIN;
+        ev.data.ptr = &mp->evt_pty;
+        if (epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD,
+                      mp->serial.pty_master, &ev) < 0) {
+            fprintf(stderr, "monitor: epoll_ctl add pty %s: %s\n",
+                    identity->dev_path, strerror(errno));
+            /* non-fatal: serial monitoring still works */
+        }
+
+        /* create PTY symlink */
+        pty_create_symlink(identity->label, mp->serial.pty_path);
+    }
+
     state->port_count++;
-    printf("  Monitoring: %s [%s] -> %s\n",
-           identity->dev_path, identity->label, mp->log.filepath);
+
+    if (mp->serial.pty_master >= 0) {
+        printf("  Monitoring: %s [%s] -> %s\n"
+               "    PTY proxy: %s/%s -> %s\n",
+               identity->dev_path, identity->label, mp->log.filepath,
+               PTY_DIR, identity->label, mp->serial.pty_path);
+    } else {
+        printf("  Monitoring: %s [%s] -> %s\n",
+               identity->dev_path, identity->label, mp->log.filepath);
+    }
 
     return idx;
 }
@@ -273,7 +354,14 @@ remove_port(monitor_state_t *state, int idx)
 
     monitored_port_t *mp = &state->ports[idx];
 
-    /* remove from epoll */
+    /* remove PTY master from epoll */
+    if (mp->serial.pty_master >= 0) {
+        epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL,
+                  mp->serial.pty_master, NULL);
+        pty_remove_symlink(mp->identity.label);
+    }
+
+    /* remove serial fd from epoll */
     if (mp->serial.fd >= 0)
         epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, mp->serial.fd, NULL);
 
@@ -288,6 +376,7 @@ remove_port(monitor_state_t *state, int idx)
     for (int i = idx; i < state->port_count - 1; i++) {
         state->ports[i] = state->ports[i + 1];
         state->ports[i].evt.index = i;
+        state->ports[i].evt_pty.index = i;
         /* re-register with epoll using updated index */
         if (state->ports[i].serial.fd >= 0 && !state->ports[i].yielded) {
             struct epoll_event ev;
@@ -295,6 +384,13 @@ remove_port(monitor_state_t *state, int idx)
             ev.data.ptr = &state->ports[i].evt;
             epoll_ctl(state->epoll_fd, EPOLL_CTL_MOD,
                       state->ports[i].serial.fd, &ev);
+        }
+        if (state->ports[i].serial.pty_master >= 0) {
+            struct epoll_event ev;
+            ev.events = EPOLLIN;
+            ev.data.ptr = &state->ports[i].evt_pty;
+            epoll_ctl(state->epoll_fd, EPOLL_CTL_MOD,
+                      state->ports[i].serial.pty_master, &ev);
         }
     }
     state->port_count--;
@@ -325,10 +421,16 @@ yield_port(monitor_state_t *state, int idx, char *resp, size_t resp_sz)
         return;
     }
 
-    /* remove from epoll and close serial fd */
+    /* remove PTY master from epoll (keep PTY alive for reconnect) */
+    if (mp->serial.pty_master >= 0)
+        epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL,
+                  mp->serial.pty_master, NULL);
+
+    /* remove serial fd from epoll and close it */
     if (mp->serial.fd >= 0) {
         epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, mp->serial.fd, NULL);
-        serial_close(&mp->serial);
+        close(mp->serial.fd);
+        mp->serial.fd = -1;
     }
 
     mp->yielded = 1;
@@ -354,24 +456,52 @@ reclaim_port(monitor_state_t *state, int idx, char *resp, size_t resp_sz)
     }
 
     /* reopen serial port */
-    if (serial_open(&mp->serial, mp->identity.dev_path,
-                    state->baudrate) < 0) {
-        snprintf(resp, resp_sz, "ERROR cannot reopen %s\n",
-                 mp->identity.dev_path);
+    int open_flags;
+    if (state->proxy_mode)
+        open_flags = O_RDWR | O_NOCTTY | O_NONBLOCK;
+    else
+        open_flags = O_RDONLY | O_NOCTTY | O_NONBLOCK;
+
+    mp->serial.fd = open(mp->identity.dev_path, open_flags);
+    if (mp->serial.fd < 0) {
+        snprintf(resp, resp_sz, "ERROR cannot reopen %s: %s\n",
+                 mp->identity.dev_path, strerror(errno));
         return;
     }
 
-    /* re-add to epoll */
+    /* reconfigure termios */
+    struct termios tty;
+    memset(&tty, 0, sizeof(tty));
+    cfsetispeed(&tty, state->baudrate);
+    cfsetospeed(&tty, state->baudrate);
+    tty.c_cflag = state->baudrate | CS8 | CREAD | CLOCAL;
+    tty.c_iflag = 0;
+    tty.c_oflag = 0;
+    tty.c_lflag = 0;
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 0;
+    tcsetattr(mp->serial.fd, TCSANOW, &tty);
+
+    /* re-add serial fd to epoll */
     mp->evt.fd = mp->serial.fd;
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.ptr = &mp->evt;
     if (epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD,
                   mp->serial.fd, &ev) < 0) {
-        serial_close(&mp->serial);
+        close(mp->serial.fd);
+        mp->serial.fd = -1;
         snprintf(resp, resp_sz, "ERROR epoll add failed for %s\n",
                  mp->identity.dev_path);
         return;
+    }
+
+    /* re-add PTY master to epoll if proxying */
+    if (mp->serial.pty_master >= 0) {
+        ev.events = EPOLLIN;
+        ev.data.ptr = &mp->evt_pty;
+        epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD,
+                  mp->serial.pty_master, &ev);
     }
 
     mp->yielded = 0;
@@ -580,6 +710,9 @@ cmd_monitor(int argc, char *argv[])
         } else if (strcmp(argv[i], "--systemd") == 0) {
             state.systemd_mode = 1;
             foreground = 1;
+        } else if (strcmp(argv[i], "--proxy") == 0 ||
+                   strcmp(argv[i], "-p") == 0) {
+            state.proxy_mode = 1;
         } else if ((strcmp(argv[i], "-b") == 0 ||
                     strcmp(argv[i], "--baud") == 0) && i + 1 < argc) {
             state.baudrate = baud_to_speed(atoi(argv[++i]));
@@ -606,10 +739,18 @@ cmd_monitor(int argc, char *argv[])
         return 1;
     }
 
+    /* create PTY directory for proxy mode */
+    if (state.proxy_mode) {
+        if (mkdirp(PTY_DIR) < 0) {
+            fprintf(stderr, "monitor: cannot create %s\n", PTY_DIR);
+        }
+    }
+
     /* prune old sessions */
     log_prune_sessions(LOG_MAX_SESSIONS);
 
-    printf("uart-monitor starting...\n");
+    printf("uart-monitor starting%s...\n",
+           state.proxy_mode ? " (proxy mode)" : "");
     printf("Session: %s\n", state.session_path);
 
     /* scan and identify ports */
@@ -694,6 +835,8 @@ cmd_monitor(int argc, char *argv[])
     printf("Monitoring... (Ctrl-C to stop)\n");
     if (!foreground)
         printf("Logs: %s/latest/*.log\n", LOG_BASE_DIR);
+    if (state.proxy_mode)
+        printf("PTY devices: %s/*\n", PTY_DIR);
 
     /* ---- main event loop ---- */
     struct epoll_event events[MAX_EPOLL_EVENTS];
@@ -749,6 +892,14 @@ cmd_monitor(int argc, char *argv[])
                 if (nr > 0) {
                     log_write(&mp->log, read_buf, (size_t)nr);
                     mp->bytes_read += (size_t)nr;
+
+                    /* proxy mode: forward serial data to PTY master
+                     * so anyone reading the PTY slave sees the output */
+                    if (mp->serial.pty_master >= 0) {
+                        ssize_t nw = write(mp->serial.pty_master,
+                                           read_buf, (size_t)nr);
+                        (void)nw; /* best effort */
+                    }
                 } else if (nr == 0 ||
                            (nr < 0 && errno != EAGAIN &&
                             errno != EWOULDBLOCK)) {
@@ -760,6 +911,32 @@ cmd_monitor(int argc, char *argv[])
                     write_status_json(&state);
                     /* adjust loop since we shifted ports */
                     i = nfds; /* break out of event loop iteration */
+                }
+                break;
+            }
+
+            case EVT_PTY: {
+                /* proxy mode: user wrote to PTY slave, forward to serial */
+                int idx = ctx->index;
+                if (idx < 0 || idx >= state.port_count)
+                    break;
+
+                monitored_port_t *mp = &state.ports[idx];
+                if (mp->serial.pty_master < 0 || mp->serial.fd < 0)
+                    break;
+
+                ssize_t nr = read(mp->serial.pty_master, read_buf,
+                                  sizeof(read_buf));
+
+                if (nr > 0) {
+                    /* forward to real serial port */
+                    ssize_t nw = write(mp->serial.fd,
+                                       read_buf, (size_t)nr);
+                    (void)nw; /* best effort */
+                } else if (nr == 0 ||
+                           (nr < 0 && errno != EAGAIN &&
+                            errno != EWOULDBLOCK && errno != EIO)) {
+                    /* PTY slave was closed -- this is normal */
                 }
                 break;
             }
@@ -775,6 +952,8 @@ cmd_monitor(int argc, char *argv[])
 
     for (int i = state.port_count - 1; i >= 0; i--) {
         monitored_port_t *mp = &state.ports[i];
+        if (mp->serial.pty_master >= 0)
+            pty_remove_symlink(mp->identity.label);
         log_marker(&mp->log, "MONITOR STOPPED");
         log_close(&mp->log);
         serial_close(&mp->serial);
@@ -790,6 +969,10 @@ cmd_monitor(int argc, char *argv[])
 
     pidfile_remove();
     unlink(STATUS_FILE);
+
+    /* clean up PTY directory if empty */
+    if (state.proxy_mode)
+        rmdir(PTY_DIR);
 
     if (state.systemd_mode)
         sd_notify_send("STOPPING=1");

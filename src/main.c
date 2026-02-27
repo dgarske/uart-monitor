@@ -24,6 +24,7 @@ usage(const char *prog)
         "\n"
         "Monitor options:\n"
         "  -f, --foreground    Run in foreground (don't daemonize)\n"
+        "  -p, --proxy         PTY proxy mode (bidirectional, TIOCEXCL)\n"
         "  --systemd           systemd notify mode (implies -f)\n"
         "  -b, --baud <rate>   Baud rate (default: 115200)\n"
         "  --only <devs>       Only monitor these devices (comma-separated)\n"
@@ -32,8 +33,10 @@ usage(const char *prog)
         "  -v, --verbose       Show full sysfs/udev details\n"
         "  --save              Save config to ~/.boards\n"
         "\n"
-        "Log files are written to /tmp/uart-monitor/latest/<tty>.log\n"
-        "AI workflow: tail -f /tmp/uart-monitor/latest/ttyUSB0.log\n",
+        "Log files:  /tmp/uart-monitor/latest/<LABEL>.log\n"
+        "PTY proxy:  /tmp/uart-monitor/pty/<LABEL>  (with --proxy)\n"
+        "\n"
+        "AI workflow: tail -f /tmp/uart-monitor/latest/POLARFIRE_SOC_UART0.log\n",
         prog);
 }
 

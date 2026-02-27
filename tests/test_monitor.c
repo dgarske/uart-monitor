@@ -166,11 +166,12 @@ test_log_prune(void)
 {
     TEST("log_prune_sessions keeps N newest");
 
+    /* use far-future timestamps to ensure these sort AFTER any real sessions */
     /* create several session dirs */
     for (int i = 0; i < 5; i++) {
         char path[512];
         snprintf(path, sizeof(path),
-                 "%s/session-20260101-00000%d", LOG_BASE_DIR, i);
+                 "%s/session-20991231-00000%d", LOG_BASE_DIR, i);
         mkdirp(path);
         /* create a dummy file so dir isn't empty */
         char fpath[600];
@@ -179,19 +180,25 @@ test_log_prune(void)
         if (fp) { fprintf(fp, "test\n"); fclose(fp); }
     }
 
+    /* prune to keep only 3 total (test sessions are the newest) */
     log_prune_sessions(3);
 
-    /* check that the 2 oldest were removed */
+    /* the 3 newest test sessions should survive */
     struct stat st;
-    char p0[512], p1[512], p4[512];
-    snprintf(p0, sizeof(p0), "%s/session-20260101-000000", LOG_BASE_DIR);
-    snprintf(p1, sizeof(p1), "%s/session-20260101-000001", LOG_BASE_DIR);
-    snprintf(p4, sizeof(p4), "%s/session-20260101-000004", LOG_BASE_DIR);
+    char p4[512];
+    snprintf(p4, sizeof(p4), "%s/session-20991231-000004", LOG_BASE_DIR);
 
-    /* the oldest should be gone (but the real session from other tests
-     * may interfere, so just check that newest exist) */
     if (stat(p4, &st) < 0) {
         FAIL("newest session was pruned");
+        /* cleanup anyway */
+        for (int i = 0; i < 5; i++) {
+            char path[512], fpath[600];
+            snprintf(path, sizeof(path),
+                     "%s/session-20991231-00000%d", LOG_BASE_DIR, i);
+            snprintf(fpath, sizeof(fpath), "%s/dummy.log", path);
+            unlink(fpath);
+            rmdir(path);
+        }
         return;
     }
     PASS();
@@ -200,7 +207,7 @@ test_log_prune(void)
     for (int i = 0; i < 5; i++) {
         char path[512], fpath[600];
         snprintf(path, sizeof(path),
-                 "%s/session-20260101-00000%d", LOG_BASE_DIR, i);
+                 "%s/session-20991231-00000%d", LOG_BASE_DIR, i);
         snprintf(fpath, sizeof(fpath), "%s/dummy.log", path);
         unlink(fpath);
         rmdir(path);
@@ -272,6 +279,119 @@ test_pty_to_log(void)
     PASS();
 }
 
+static void
+test_label_log_filename(void)
+{
+    TEST("log file uses label as filename");
+    char session_path[512];
+    log_create_session(session_path, sizeof(session_path));
+
+    log_file_t lf;
+    if (log_open(&lf, session_path, "POLARFIRE_SOC_UART0",
+                 "Test label\n") < 0) {
+        FAIL("log_open with label failed");
+        return;
+    }
+
+    /* verify the filepath uses the label */
+    if (strstr(lf.filepath, "POLARFIRE_SOC_UART0.log") == NULL) {
+        FAIL("filepath doesn't contain label");
+        log_close(&lf);
+        return;
+    }
+
+    log_write(&lf, "label test data\n", 16);
+    log_close(&lf);
+
+    /* verify file exists and has content */
+    FILE *fp = fopen(lf.filepath, "r");
+    if (!fp) { FAIL("cannot read label log"); return; }
+
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "label test data"))
+            found = 1;
+    }
+    fclose(fp);
+
+    if (!found) { FAIL("data not in label log"); return; }
+    PASS();
+}
+
+static void
+test_proxy_log_and_forward(void)
+{
+    TEST("proxy: serial -> log + PTY forward");
+
+    /* create a simulated "real port" via PTY */
+    int real_master, real_slave;
+    if (openpty(&real_master, &real_slave, NULL, NULL, NULL) < 0) {
+        FAIL("openpty failed");
+        return;
+    }
+    char *real_slave_name = ttyname(real_slave);
+    close(real_slave);
+
+    /* open in proxy mode */
+    serial_port_t sp;
+    if (serial_open_proxy(&sp, real_slave_name, B115200) < 0) {
+        FAIL("serial_open_proxy failed");
+        close(real_master);
+        return;
+    }
+
+    char session_path[512];
+    log_create_session(session_path, sizeof(session_path));
+
+    log_file_t lf;
+    log_open(&lf, session_path, "PROXY_TEST", "Proxy Test\n");
+
+    /* simulate board output on the "real port" */
+    const char *msg = "Board booting...\n";
+    ssize_t nw = write(real_master, msg, strlen(msg));
+    (void)nw;
+    usleep(100000);
+
+    /* read from serial fd (real port) */
+    char buf[4096];
+    fd_set rfds;
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    FD_ZERO(&rfds);
+    FD_SET(sp.fd, &rfds);
+
+    if (select(sp.fd + 1, &rfds, NULL, NULL, &tv) > 0) {
+        ssize_t nr = read(sp.fd, buf, sizeof(buf));
+        if (nr > 0) {
+            /* log the data */
+            log_write(&lf, buf, (size_t)nr);
+            /* forward to PTY master (like monitor does) */
+            nw = write(sp.pty_master, buf, (size_t)nr);
+            (void)nw;
+        }
+    }
+
+    log_close(&lf);
+
+    /* verify log file has the data */
+    FILE *fp = fopen(lf.filepath, "r");
+    if (!fp) { FAIL("cannot read log"); serial_close(&sp); close(real_master); return; }
+
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "Board booting"))
+            found = 1;
+    }
+    fclose(fp);
+
+    serial_close(&sp);
+    close(real_master);
+
+    if (!found) { FAIL("data not in proxy log"); return; }
+    PASS();
+}
+
 int main(void)
 {
     printf("=== test_monitor ===\n");
@@ -282,6 +402,8 @@ int main(void)
     test_log_crlf_handling();
     test_log_prune();
     test_pty_to_log();
+    test_label_log_filename();
+    test_proxy_log_and_forward();
 
     printf("\n  Results: %d passed, %d failed\n\n",
            tests_passed, tests_failed);

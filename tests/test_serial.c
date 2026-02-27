@@ -208,6 +208,146 @@ test_double_close(void)
     PASS();
 }
 
+static void
+test_proxy_open_close(void)
+{
+    TEST("serial_open_proxy creates PTY pair");
+    int master;
+    char slave_path[256];
+    if (create_pty_pair(&master, slave_path, sizeof(slave_path)) < 0) {
+        FAIL("cannot create PTY pair");
+        return;
+    }
+
+    serial_port_t sp;
+    int ret = serial_open_proxy(&sp, slave_path, B115200);
+    if (ret < 0) {
+        FAIL("serial_open_proxy failed");
+        close(master);
+        return;
+    }
+
+    if (sp.fd < 0) {
+        FAIL("fd is negative");
+        close(master);
+        return;
+    }
+    if (sp.pty_master < 0) {
+        FAIL("pty_master is negative");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+    if (sp.pty_path[0] == '\0') {
+        FAIL("pty_path is empty");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    serial_close(&sp);
+    if (sp.fd != -1 || sp.pty_master != -1) {
+        FAIL("fds not -1 after close");
+        close(master);
+        return;
+    }
+
+    close(master);
+    PASS();
+}
+
+static void
+test_proxy_bidirectional(void)
+{
+    TEST("proxy forwards data bidirectionally");
+    int master;
+    char slave_path[256];
+    if (create_pty_pair(&master, slave_path, sizeof(slave_path)) < 0) {
+        FAIL("cannot create PTY pair");
+        return;
+    }
+
+    serial_port_t sp;
+    if (serial_open_proxy(&sp, slave_path, B115200) < 0) {
+        FAIL("serial_open_proxy failed");
+        close(master);
+        return;
+    }
+
+    /* 1. Write through the "real port" master -> read from serial fd */
+    const char *msg = "from_board\n";
+    ssize_t nw = write(master, msg, strlen(msg));
+    (void)nw;
+    usleep(50000);
+
+    char buf[256];
+    fd_set rfds;
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    FD_ZERO(&rfds);
+    FD_SET(sp.fd, &rfds);
+    if (select(sp.fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+        FAIL("no data from serial fd");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    ssize_t nr = read(sp.fd, buf, sizeof(buf) - 1);
+    if (nr <= 0 || strstr(buf, "from_board") == NULL) {
+        FAIL("serial fd read mismatch");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    /* 2. Write to PTY slave (user side) -> should be readable from pty_master */
+    int pty_slave = open(sp.pty_path, O_RDWR | O_NOCTTY);
+    if (pty_slave < 0) {
+        FAIL("cannot open PTY slave");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    const char *cmd = "user_cmd\n";
+    nw = write(pty_slave, cmd, strlen(cmd));
+    (void)nw;
+    usleep(50000);
+
+    tv.tv_sec = 1; tv.tv_usec = 0;
+    FD_ZERO(&rfds);
+    FD_SET(sp.pty_master, &rfds);
+    if (select(sp.pty_master + 1, &rfds, NULL, NULL, &tv) <= 0) {
+        FAIL("no data from pty_master");
+        close(pty_slave);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    nr = read(sp.pty_master, buf, sizeof(buf) - 1);
+    if (nr <= 0) {
+        FAIL("pty_master read failed");
+        close(pty_slave);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+    buf[nr] = '\0';
+    if (strstr(buf, "user_cmd") == NULL) {
+        FAIL("pty_master read mismatch");
+        close(pty_slave);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    close(pty_slave);
+    serial_close(&sp);
+    close(master);
+    PASS();
+}
+
 int main(void)
 {
     printf("=== test_serial ===\n");
@@ -216,6 +356,8 @@ int main(void)
     test_read_data();
     test_readonly();
     test_double_close();
+    test_proxy_open_close();
+    test_proxy_bidirectional();
 
     printf("\n  Results: %d passed, %d failed\n\n",
            tests_passed, tests_failed);
