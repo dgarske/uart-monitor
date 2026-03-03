@@ -64,6 +64,9 @@ systemctl --user status uart-monitor
 
 # View daemon logs
 journalctl --user -u uart-monitor -f
+
+# Restart
+systemctl --user restart uart-monitor
 ```
 
 ## Usage

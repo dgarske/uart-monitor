@@ -4,7 +4,7 @@ After=local-fs.target
 
 [Service]
 Type=notify
-ExecStart=%h/.local/bin/uart-monitor monitor --systemd
+ExecStart=%h/.local/bin/uart-monitor monitor --systemd --proxy
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
