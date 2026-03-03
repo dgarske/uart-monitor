@@ -202,7 +202,12 @@ get_device_label(tty_port_t *port)
             if (*p == ' ') *p = '_';
             if (*p >= 'a' && *p <= 'z') *p -= 32;
         }
-        if (port->known->expected_ports > 1) {
+        if (strcmp(clean, "GENERIC") == 0) {
+            /* Generic devices: include tty name to avoid collisions
+             * when multiple unidentified adapters are present */
+            snprintf(port->label, sizeof(port->label),
+                     "%.24s_UART_%s", clean, port->tty_name);
+        } else if (port->known->expected_ports > 1) {
             snprintf(port->label, sizeof(port->label),
                      "%.48s_UART%d", clean, port->interface_num);
         } else {

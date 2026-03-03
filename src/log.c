@@ -102,12 +102,17 @@ log_write(log_file_t *lf, const char *data, size_t len)
     for (size_t i = 0; i < len; i++) {
         char c = data[i];
 
-        /* skip bare \r (handle \r\n and \r as just newlines) */
+        /* Handle \r\n sequences that may span read() boundaries:
+         * - \r sets last_was_cr flag and is treated as newline
+         * - \n after \r (same buffer or next) is skipped as duplicate */
+        if (c == '\n' && lf->last_was_cr) {
+            lf->last_was_cr = 0;
+            continue;
+        }
+        lf->last_was_cr = 0;
+
         if (c == '\r') {
-            /* peek ahead: if next is \n, skip the \r */
-            if (i + 1 < len && data[i + 1] == '\n')
-                continue;
-            /* bare \r -> treat as newline */
+            lf->last_was_cr = 1;
             c = '\n';
         }
 

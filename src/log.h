@@ -18,6 +18,7 @@ typedef struct {
     /* line buffer for timestamp insertion */
     char   linebuf[LOG_LINE_BUF_SIZE];
     int    linebuf_len;
+    int    last_was_cr;       /* track \r across read() boundaries */
     struct timespec last_flush;
 } log_file_t;
 
