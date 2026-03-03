@@ -104,9 +104,12 @@ log_write(log_file_t *lf, const char *data, size_t len)
 
         /* Handle \r\n sequences that may span read() boundaries:
          * - \r sets last_was_cr flag and is treated as newline
-         * - \n after \r (same buffer or next) is skipped as duplicate */
-        if (c == '\n' && lf->last_was_cr) {
-            lf->last_was_cr = 0;
+         * - \n after \r (same buffer or next) is skipped as duplicate
+         * - \r after \r is skipped (handles \r\r\n from devices whose
+         *   C runtime converts \n->\r\n, turning source \r\n into \r\r\n) */
+        if (lf->last_was_cr && (c == '\n' || c == '\r')) {
+            if (c == '\n')
+                lf->last_was_cr = 0;
             continue;
         }
         lf->last_was_cr = 0;
