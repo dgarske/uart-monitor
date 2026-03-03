@@ -847,8 +847,17 @@ cmd_monitor(int argc, char *argv[])
     char read_buf[READ_BUF_SIZE];
 
     while (state.running) {
+        /* Use short timeout only when a partial line needs flushing;
+         * otherwise block indefinitely to avoid wasting CPU. */
+        int timeout_ms = -1;
+        for (int i = 0; i < state.port_count; i++) {
+            if (state.ports[i].log.linebuf_len > 0) {
+                timeout_ms = 200;
+                break;
+            }
+        }
         int nfds = epoll_wait(state.epoll_fd, events,
-                              MAX_EPOLL_EVENTS, 500);
+                              MAX_EPOLL_EVENTS, timeout_ms);
 
         if (nfds < 0) {
             if (errno == EINTR)
