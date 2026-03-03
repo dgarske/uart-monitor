@@ -19,6 +19,7 @@ typedef struct {
     char   linebuf[LOG_LINE_BUF_SIZE];
     int    linebuf_len;
     int    last_was_cr;       /* track \r across read() boundaries */
+    int    timestamps;        /* prepend [timestamp] to each line */
     struct timespec last_flush;
 } log_file_t;
 

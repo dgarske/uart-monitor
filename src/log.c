@@ -116,7 +116,7 @@ log_write(log_file_t *lf, const char *data, size_t len)
             c = '\n';
         }
 
-        if (lf->linebuf_len == 0 && c != '\n') {
+        if (lf->linebuf_len == 0 && c != '\n' && lf->timestamps) {
             /* starting a new line: write timestamp */
             write_timestamp(lf);
         }

@@ -25,6 +25,7 @@ usage(const char *prog)
         "Monitor options:\n"
         "  -f, --foreground    Run in foreground (don't daemonize)\n"
         "  -p, --proxy         PTY proxy mode (bidirectional, TIOCEXCL)\n"
+        "  -t, --timestamps    Prepend [timestamp] to each log line\n"
         "  --systemd           systemd notify mode (implies -f)\n"
         "  -b, --baud <rate>   Baud rate (default: 115200)\n"
         "  --only <devs>       Only monitor these devices (comma-separated)\n"

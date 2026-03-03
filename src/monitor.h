@@ -48,6 +48,7 @@ typedef struct {
     volatile int     running;
     int              systemd_mode;
     int              proxy_mode;      /* --proxy: PTY proxy for shared access */
+    int              timestamps;      /* --timestamps: prepend [ts] to log lines */
     speed_t          baudrate;
     char             only_filter[512];  /* comma-separated device filter */
 } monitor_state_t;

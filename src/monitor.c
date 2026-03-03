@@ -280,6 +280,7 @@ add_port(monitor_state_t *state, tty_port_t *identity)
         serial_close(&mp->serial);
         return -1;
     }
+    mp->log.timestamps = state->timestamps;
 
     /* create a tty_name.log -> label.log symlink for compatibility */
     if (strcmp(identity->tty_name, identity->label) != 0) {
@@ -713,6 +714,9 @@ cmd_monitor(int argc, char *argv[])
         } else if (strcmp(argv[i], "--proxy") == 0 ||
                    strcmp(argv[i], "-p") == 0) {
             state.proxy_mode = 1;
+        } else if (strcmp(argv[i], "--timestamps") == 0 ||
+                   strcmp(argv[i], "-t") == 0) {
+            state.timestamps = 1;
         } else if ((strcmp(argv[i], "-b") == 0 ||
                     strcmp(argv[i], "--baud") == 0) && i + 1 < argc) {
             state.baudrate = baud_to_speed(atoi(argv[++i]));
