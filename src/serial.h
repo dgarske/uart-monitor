@@ -9,6 +9,7 @@
 typedef struct {
     int     fd;              /* real serial port fd */
     int     pty_master;      /* PTY master fd (-1 if not proxying) */
+    int     pty_slave;       /* PTY slave fd (kept open to prevent EIO) */
     char    pty_path[256];   /* PTY slave path (e.g. /dev/pts/5) */
     char    dev_path[256];
     speed_t baudrate;

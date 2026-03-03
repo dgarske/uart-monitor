@@ -49,6 +49,7 @@ serial_open(serial_port_t *sp, const char *dev_path, speed_t baud)
 {
     sp->fd = -1;
     sp->pty_master = -1;
+    sp->pty_slave = -1;
     sp->pty_path[0] = '\0';
     strlcpy_safe(sp->dev_path, dev_path, sizeof(sp->dev_path));
     sp->baudrate = baud;
@@ -74,6 +75,7 @@ serial_open_proxy(serial_port_t *sp, const char *dev_path, speed_t baud)
 {
     sp->fd = -1;
     sp->pty_master = -1;
+    sp->pty_slave = -1;
     sp->pty_path[0] = '\0';
     strlcpy_safe(sp->dev_path, dev_path, sizeof(sp->dev_path));
     sp->baudrate = baud;
@@ -113,7 +115,10 @@ serial_open_proxy(serial_port_t *sp, const char *dev_path, speed_t baud)
         /* non-fatal: PTY slave may not fully support all termios */
     }
 
-    close(slave); /* users open the slave path themselves */
+    /* Keep slave fd open -- if all slave fds are closed, the PTY master
+     * becomes perpetually readable (EIO), causing an epoll busy loop.
+     * Holding one reference keeps the PTY pair alive and quiescent. */
+    sp->pty_slave = slave;
 
     /* set PTY master to non-blocking for epoll */
     int flags = fcntl(master, F_GETFL);
@@ -130,6 +135,10 @@ serial_open_proxy(serial_port_t *sp, const char *dev_path, speed_t baud)
 void
 serial_close(serial_port_t *sp)
 {
+    if (sp->pty_slave >= 0) {
+        close(sp->pty_slave);
+        sp->pty_slave = -1;
+    }
     if (sp->pty_master >= 0) {
         close(sp->pty_master);
         sp->pty_master = -1;
