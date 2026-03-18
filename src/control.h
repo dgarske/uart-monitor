@@ -20,6 +20,7 @@ int control_send_cmd(const char *sock_path, const char *cmd);
 int cmd_status(int argc, char *argv[]);
 int cmd_yield(int argc, char *argv[]);
 int cmd_reclaim(int argc, char *argv[]);
+int cmd_clear(int argc, char *argv[]);
 int cmd_tail(int argc, char *argv[]);
 
 #endif /* CONTROL_H */

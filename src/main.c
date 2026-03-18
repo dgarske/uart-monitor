@@ -20,6 +20,7 @@ usage(const char *prog)
         "  status          Query running daemon status\n"
         "  yield <dev>     Release a port for flashing\n"
         "  reclaim <dev>   Re-acquire a yielded port\n"
+        "  clear <dev>     Truncate log for a port (or --all)\n"
         "  tail <dev>      Tail the latest log for a port\n"
         "\n"
         "Monitor options:\n"
@@ -61,6 +62,8 @@ main(int argc, char *argv[])
         return cmd_yield(argc - 1, argv + 1);
     if (strcmp(cmd, "reclaim") == 0)
         return cmd_reclaim(argc - 1, argv + 1);
+    if (strcmp(cmd, "clear") == 0)
+        return cmd_clear(argc - 1, argv + 1);
     if (strcmp(cmd, "tail") == 0)
         return cmd_tail(argc - 1, argv + 1);
     if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {

@@ -36,6 +36,8 @@ uart-monitor monitor --only /dev/ttyUSB0,/dev/ttyACM0  # Filter ports
 uart-monitor status                # Query running daemon status (JSON)
 uart-monitor yield /dev/ttyUSB0    # Release port for flashing
 uart-monitor reclaim /dev/ttyUSB0  # Re-acquire port after flashing
+uart-monitor clear STM32N657_UART  # Truncate log (by label, tty name, or path)
+uart-monitor clear --all           # Truncate all log files
 uart-monitor tail POLARFIRE_SOC_UART0  # Tail latest log by label
 uart-monitor tail ttyUSB0          # Tail latest log by tty name
 ```
@@ -51,6 +53,35 @@ tail -f /tmp/uart-monitor/latest/ttyUSB0.log   # symlink to label-named file
 uart-monitor tail POLARFIRE_SOC_UART0
 uart-monitor tail ttyUSB0
 ```
+
+### Clearing Logs (CI / Automated Testing)
+
+Clear a log before an action to guarantee any subsequent output is new:
+
+```bash
+uart-monitor clear STM32N657_UART       # clear by label
+uart-monitor clear /dev/ttyACM0         # clear by device path
+uart-monitor clear ttyACM0              # clear by tty name
+uart-monitor clear --all                # clear all ports
+
+# CI pattern: clear, act, then wait for new output
+uart-monitor clear STM32N657_UART
+# ... flash firmware or trigger action ...
+tail -f /tmp/uart-monitor/latest/STM32N657_UART.log | grep -m1 "Boot complete"
+```
+
+### Timestamps for CI
+
+Use `--timestamps` (`-t`) when running in CI to correlate UART output with
+build/flash events. Each log line gets a `[YYYY-MM-DD HH:MM:SS]` prefix:
+
+```bash
+uart-monitor monitor -f --proxy --timestamps
+# Produces: [2026-03-18 14:30:12] U-Boot SPL 2024.01
+```
+
+Without `--timestamps`, raw device output is logged as-is (better for
+interactive use and grep).
 
 ### Flashing Firmware (Yield/Reclaim)
 

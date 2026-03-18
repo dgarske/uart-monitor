@@ -43,6 +43,10 @@ void log_flush(log_file_t *lf);
 /* Write a marker line (e.g. yield/reclaim/disconnect). */
 void log_marker(log_file_t *lf, const char *msg);
 
+/* Truncate/clear a log file. Resets contents and byte counter.
+ * Writes a "LOG CLEARED" marker after truncation. */
+void log_clear(log_file_t *lf);
+
 /* Close a log file. */
 void log_close(log_file_t *lf);
 

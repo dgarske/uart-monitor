@@ -189,6 +189,35 @@ log_marker(log_file_t *lf, const char *msg)
 }
 
 void
+log_clear(log_file_t *lf)
+{
+    if (!lf->fp)
+        return;
+
+    /* flush any pending partial line */
+    if (lf->linebuf_len > 0) {
+        lf->linebuf_len = 0;
+    }
+    lf->last_was_cr = 0;
+
+    /* reopen file in truncate mode */
+    fclose(lf->fp);
+    lf->fp = fopen(lf->filepath, "w");
+    if (!lf->fp) {
+        fprintf(stderr, "log: cannot reopen %s: %s\n",
+                lf->filepath, strerror(errno));
+        return;
+    }
+
+    /* restore line-buffered for tail -f friendliness */
+    setvbuf(lf->fp, NULL, _IOLBF, 0);
+    lf->bytes_written = 0;
+    clock_gettime(CLOCK_MONOTONIC, &lf->last_flush);
+
+    log_marker(lf, "LOG CLEARED");
+}
+
+void
 log_close(log_file_t *lf)
 {
     if (lf->fp) {

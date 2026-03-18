@@ -3,6 +3,8 @@
  * Protocol: newline-delimited text commands.
  *   YIELD /dev/ttyUSB0\n  -> OK yielded /dev/ttyUSB0\n
  *   RECLAIM /dev/ttyUSB0\n -> OK reclaimed /dev/ttyUSB0\n
+ *   CLEAR <dev|label>\n   -> OK cleared /dev/ttyUSB0\n
+ *   CLEAR --all\n         -> OK cleared N port(s)\n
  *   STATUS\n               -> JSON blob\n
  *   QUIT\n                 -> OK shutting down\n
  */
@@ -134,6 +136,28 @@ cmd_reclaim(int argc, char *argv[])
     }
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "RECLAIM %s\n", argv[1]);
+    return control_send_cmd(CONTROL_SOCK_PATH, cmd);
+}
+
+int
+cmd_clear(int argc, char *argv[])
+{
+    if (argc >= 2 && strcmp(argv[1], "--all") == 0) {
+        return control_send_cmd(CONTROL_SOCK_PATH, "CLEAR --all\n");
+    }
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: uart-monitor clear <device|label|--all>\n");
+        fprintf(stderr, "Examples:\n");
+        fprintf(stderr, "  uart-monitor clear /dev/ttyUSB0\n");
+        fprintf(stderr, "  uart-monitor clear ttyUSB0\n");
+        fprintf(stderr, "  uart-monitor clear STM32N657_UART\n");
+        fprintf(stderr, "  uart-monitor clear --all\n");
+        return 1;
+    }
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "CLEAR %s\n", argv[1]);
     return control_send_cmd(CONTROL_SOCK_PATH, cmd);
 }
 

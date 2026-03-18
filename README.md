@@ -87,6 +87,9 @@ uart-monitor monitor --only /dev/ttyUSB0,/dev/ttyACM0  # Filter ports
 uart-monitor status             # Query running daemon status (JSON)
 uart-monitor yield /dev/ttyUSB0 # Release port for flashing
 uart-monitor reclaim /dev/ttyUSB0  # Re-acquire port after flashing
+uart-monitor clear STM32N657_UART  # Truncate log for a port (by label)
+uart-monitor clear /dev/ttyACM0   # Truncate log for a port (by device)
+uart-monitor clear --all           # Truncate all log files
 uart-monitor tail POLARFIRE_SOC_UART0  # Tail latest log by label
 uart-monitor tail ttyUSB0       # Tail latest log by tty name
 ```
@@ -110,6 +113,39 @@ uart-monitor yield /dev/ttyUSB0
 # Reclaim the port to resume monitoring:
 uart-monitor reclaim /dev/ttyUSB0
 ```
+
+### Clearing Logs (CI Workflow)
+
+In CI/automated testing, clear a log before an action so you can reliably
+detect new output without confusing it with stale data:
+
+```bash
+# Clear the log, then flash, then wait for new output
+uart-monitor clear STM32N657_UART
+# ... flash firmware or trigger action ...
+# Now any output in the log is guaranteed to be new
+tail -f /tmp/uart-monitor/latest/STM32N657_UART.log | grep -m1 "Boot complete"
+```
+
+Accepts device paths (`/dev/ttyACM0`), tty names (`ttyACM0`), or labels
+(`STM32N657_UART`). Use `--all` to clear every monitored port at once.
+
+### Timestamps
+
+Start the monitor with `-t` / `--timestamps` to prepend `[YYYY-MM-DD HH:MM:SS]`
+to every log line. This is useful in CI to correlate UART output with build/flash
+events:
+
+```bash
+uart-monitor monitor -f --proxy --timestamps
+
+# Log lines will look like:
+# [2026-03-18 14:30:12] U-Boot SPL 2024.01
+# [2026-03-18 14:30:13] DRAM: 2 GiB
+```
+
+Without `--timestamps`, raw device output is logged as-is (better for
+interactive use and `grep`).
 
 ### PTY Proxy Mode
 
@@ -183,6 +219,8 @@ Started: 2026-02-25 14:30:12.456
 [2026-02-25 14:30:12.789] U-Boot SPL 2024.01 (Jan 15 2024 - 10:23:45)
 [2026-02-25 14:30:12.801] DRAM:  2 GiB
 [2026-02-25 14:30:13.002] Loading kernel...
+
+--- LOG CLEARED [2026-02-25 14:34:00.000] ---
 
 --- PORT YIELDED (released for flashing) [2026-02-25 14:35:00.123] ---
 

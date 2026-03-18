@@ -407,6 +407,31 @@ find_port_by_path(monitor_state_t *state, const char *dev_path)
     return -1;
 }
 
+/* Find a port by device path, label, or tty name.
+ * Tries exact dev_path match first, then label, then tty_name. */
+static int
+find_port_by_name(monitor_state_t *state, const char *name)
+{
+    /* try exact device path first */
+    int idx = find_port_by_path(state, name);
+    if (idx >= 0)
+        return idx;
+
+    /* strip /dev/ prefix if present */
+    const char *stripped = name;
+    if (strncmp(name, "/dev/", 5) == 0)
+        stripped = name + 5;
+
+    /* try label match, then tty_name */
+    for (int i = 0; i < state->port_count; i++) {
+        if (strcmp(state->ports[i].identity.label, stripped) == 0)
+            return i;
+        if (strcmp(state->ports[i].identity.tty_name, stripped) == 0)
+            return i;
+    }
+    return -1;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Yield / Reclaim                                                   */
 /* ------------------------------------------------------------------ */
@@ -517,6 +542,39 @@ reclaim_port(monitor_state_t *state, int idx, char *resp, size_t resp_sz)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Clear logs                                                        */
+/* ------------------------------------------------------------------ */
+
+static void
+clear_port_log(monitor_state_t *state, int idx, char *resp, size_t resp_sz)
+{
+    monitored_port_t *mp = &state->ports[idx];
+    log_clear(&mp->log);
+
+    printf("  Cleared: %s [%s]\n",
+           mp->identity.dev_path, mp->identity.label);
+
+    write_status_json(state);
+
+    snprintf(resp, resp_sz, "OK cleared %s\n", mp->identity.dev_path);
+}
+
+static void
+clear_all_logs(monitor_state_t *state, char *resp, size_t resp_sz)
+{
+    for (int i = 0; i < state->port_count; i++) {
+        log_clear(&state->ports[i].log);
+        printf("  Cleared: %s [%s]\n",
+               state->ports[i].identity.dev_path,
+               state->ports[i].identity.label);
+    }
+
+    write_status_json(state);
+
+    snprintf(resp, resp_sz, "OK cleared %d port(s)\n", state->port_count);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Control socket command handling                                    */
 /* ------------------------------------------------------------------ */
 
@@ -566,6 +624,20 @@ handle_control_cmd(monitor_state_t *state, int client_fd)
                      "ERROR port not found: %s\n", dev);
         } else {
             reclaim_port(state, idx, resp, sizeof(resp));
+        }
+    } else if (strncmp(buf, "CLEAR", 5) == 0) {
+        if (strcmp(buf, "CLEAR --all") == 0 ||
+            strcmp(buf, "CLEAR") == 0) {
+            clear_all_logs(state, resp, sizeof(resp));
+        } else if (strncmp(buf, "CLEAR ", 6) == 0) {
+            const char *name = buf + 6;
+            int idx = find_port_by_name(state, name);
+            if (idx < 0) {
+                snprintf(resp, sizeof(resp),
+                         "ERROR port not found: %s\n", name);
+            } else {
+                clear_port_log(state, idx, resp, sizeof(resp));
+            }
         }
     } else if (strcmp(buf, "QUIT") == 0) {
         snprintf(resp, sizeof(resp), "OK shutting down\n");
