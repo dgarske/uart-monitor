@@ -46,11 +46,17 @@ static const known_device_t KNOWN_DEVICES[] = {
     { 0x10c4, 0xea60, "Silicon Labs CP210x", 1,
       { "PolarFire SoC", "Generic", NULL, NULL } },
 
+    /* NXP */
+    { 0x1fc9, 0x0090, "NXP LPC-Link2 CMSIS-DAP", 1,
+      { "LPC54S018M-EVK", "NXP LPC boards", NULL, NULL } },
+
     /* STMicroelectronics */
     { 0x0483, 0x374b, "STM32 ST-LINK",         1,
       { "STM32H563", "STM32 boards", NULL, NULL } },
     { 0x0483, 0x374e, "STM32 Virtual COM Port", 1,
       { "STM32H563", NULL, NULL, NULL } },
+    { 0x0483, 0x3754, "STM32 STLINK-V3",       1,
+      { "STM32N657", "STM32 boards", NULL, NULL } },
     { 0x0483, 0x5740, "STM32 USB CDC",          1,
       { "USB Relay Controller", NULL, NULL, NULL } },
 

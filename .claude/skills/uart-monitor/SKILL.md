@@ -1,11 +1,7 @@
 ---
 name: uart-monitor
-description: >
-  UART monitoring daemon for embedded development. Use this skill when the user
-  needs to monitor serial ports (ttyUSB, ttyACM, ttyUART), read UART output from
-  embedded boards, flash firmware while monitoring, or interact with serial devices.
-  Covers reading logs, yield/reclaim for flashing, PTY proxy mode, and board identification.
-user-invocable: false
+description: "UART monitoring daemon for embedded development. Use this skill when the user needs to monitor serial ports (ttyUSB, ttyACM, ttyUART), read UART output from embedded boards, flash firmware while monitoring, or interact with serial devices. Covers reading logs, yield/reclaim for flashing, PTY proxy mode, and board identification."
+user-invokable: false
 ---
 
 # uart-monitor -- Background UART Monitor Daemon
@@ -124,8 +120,9 @@ tail -f /tmp/uart-monitor/latest/POLARFIRE_SOC_UART0.log
 ## Supported Boards
 
 The daemon auto-identifies boards by USB VID:PID via sysfs:
-VMK180, ZCU102, PolarFire SoC, STM32H563, FTDI (FT232/FT2232/FT4232),
-CP210x, CH340, PL2303, Cypress FX3. Board overrides from `~/.boards`.
+VMK180, ZCU102, PolarFire SoC, NXP LPC54S018M-EVK (LPC-Link2), STM32H563,
+STM32N657 (STLINK-V3), FTDI (FT232/FT2232/FT4232), CP210x, CH340, PL2303,
+Cypress FX3. Board overrides from `~/.boards`.
 
 ## Architecture
 
