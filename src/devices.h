@@ -71,7 +71,7 @@ static const known_device_t KNOWN_DEVICES[] = {
     { 0x0483, 0x374e, "STM32 Virtual COM Port", 1,
       { "STM32H563", NULL, NULL, NULL } },
     { 0x0483, 0x3754, "STM32 STLINK-V3",       1,
-      { "STM32N657", "STM32 boards", NULL, NULL } },
+      { "STM32N657", "STM32C5A3", "STM32 boards", NULL } },
     { 0x0483, 0x5740, "STM32 USB CDC",          1,
       { "USB Relay Controller", NULL, NULL, NULL } },
 

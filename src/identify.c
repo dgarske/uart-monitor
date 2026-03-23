@@ -320,6 +320,11 @@ load_board_config(board_id_t *ids, int max_ids)
                     len = sizeof(current_board) - 1;
                 memcpy(current_board, trimmed + 6, len);
                 current_board[len] = '\0';
+                /* strip parenthetical suffix e.g. " (STLINK-V3)" */
+                char *paren = strrchr(current_board, '(');
+                if (paren && paren > current_board && *(paren - 1) == ' ') {
+                    *(paren - 1) = '\0';
+                }
             }
             continue;
         }
