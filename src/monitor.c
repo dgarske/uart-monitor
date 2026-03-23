@@ -1,15 +1,22 @@
-/* monitor.c -- Main epoll-based monitoring daemon.
+/* monitor.c
  *
- * Single-threaded event loop multiplexing:
- *   - Serial port reads (one per monitored device)
- *   - PTY master reads (proxy mode: user writing to virtual port)
- *   - Netlink/inotify hot-plug events
- *   - Unix domain socket control commands
- *   - signalfd for SIGTERM/SIGINT/SIGHUP
+ * Copyright (C) 2025 wolfSSL Inc.
  *
- * In read-only mode: opens ports O_RDONLY, never writes.
- * In proxy mode (--proxy): opens ports O_RDWR, creates PTY pairs,
- *   forwards bidirectionally, sets TIOCEXCL on the real port.
+ * This file is part of uart-monitor.
+ *
+ * uart-monitor is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * uart-monitor is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 #include "monitor.h"
 #include "hotplug.h"
