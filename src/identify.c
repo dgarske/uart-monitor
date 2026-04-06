@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 #include "identify.h"
+#include "log.h"
 #include "util.h"
 
 #include <dirent.h>
@@ -476,9 +477,27 @@ print_port_table(device_group_t *groups, int ngroups, int verbose)
         if (verbose) {
             printf("\n  Labels:\n");
             for (int p = 0; p < grp->port_count; p++) {
-                printf("    %s -> %s\n",
-                       grp->ports[p]->dev_path,
-                       grp->ports[p]->label);
+                tty_port_t *port = grp->ports[p];
+                printf("    %s -> %s\n", port->dev_path, port->label);
+
+                /* show log file path if it exists */
+                char logpath[512];
+                snprintf(logpath, sizeof(logpath),
+                         LOG_BASE_DIR "/latest/%s.log", port->label);
+                if (access(logpath, F_OK) == 0)
+                    printf("      Log: %s\n", logpath);
+
+                /* show PTY proxy path if it exists */
+                char ptypath[512];
+                char ptytarget[256];
+                snprintf(ptypath, sizeof(ptypath),
+                         LOG_BASE_DIR "/pty/%s", port->label);
+                ssize_t len = readlink(ptypath, ptytarget,
+                                       sizeof(ptytarget) - 1);
+                if (len > 0) {
+                    ptytarget[len] = '\0';
+                    printf("      PTY: %s -> %s\n", ptypath, ptytarget);
+                }
             }
         }
     }
