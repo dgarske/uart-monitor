@@ -151,6 +151,9 @@ identify_port(const char *dev_path, tty_port_t *port)
     /* look up in known device table */
     port->known = lookup_known_device(port->vid, port->pid);
 
+    /* try to match board by USB product string */
+    port->board_match = lookup_board_by_product(port->product);
+
     /* determine function name */
     if (port->known) {
         port->function_name =
@@ -205,6 +208,24 @@ get_device_label(tty_port_t *port)
         }
         snprintf(port->label, sizeof(port->label),
                  "%.48s_UART%d", board, port->interface_num);
+        return;
+    }
+
+    /* If board matched by USB product string */
+    if (port->board_match) {
+        char clean[48];
+        strlcpy_safe(clean, port->board_match, sizeof(clean));
+        for (char *p = clean; *p; p++) {
+            if (*p == ' ') *p = '_';
+            if (*p >= 'a' && *p <= 'z') *p -= 32;
+        }
+        if (port->known && port->known->expected_ports > 1) {
+            snprintf(port->label, sizeof(port->label),
+                     "%.48s_UART%d", clean, port->interface_num);
+        } else {
+            snprintf(port->label, sizeof(port->label),
+                     "%.48s_UART", clean);
+        }
         return;
     }
 
@@ -410,6 +431,8 @@ print_port_table(device_group_t *groups, int ngroups, int verbose)
         printf("  Possible Board: ");
         if (first->board_override) {
             printf("%s", first->board_override);
+        } else if (first->board_match) {
+            printf("%s", first->board_match);
         } else if (first->known) {
             for (int b = 0; b < MAX_BOARDS_PER_DEVICE &&
                             first->known->boards[b]; b++) {

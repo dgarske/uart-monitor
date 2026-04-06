@@ -41,6 +41,7 @@ typedef struct {
     const known_device_t *known;
     const char *function_name;
     const char *board_override;
+    const char *board_match;   /* from USB product string match */
     char label[64];      /* filesystem-safe name, e.g. "VMK180_UART1" */
 } tty_port_t;
 

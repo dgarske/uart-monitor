@@ -45,7 +45,7 @@ static const known_device_t KNOWN_DEVICES[] = {
     { 0x0403, 0x6010, "FTDI FT2232H", 2,
       { "VMK180", "ZCU102", "Various", NULL } },
     { 0x0403, 0x6011, "FTDI FT4232H", 4,
-      { "VMK180", "ZCU102", NULL, NULL } },
+      { "VMK180", "ZCU102", "SCU35", NULL } },
     { 0x0403, 0x6014, "FTDI FT232H",  1,
       { "Generic", NULL, NULL, NULL } },
     { 0x0403, 0x6001, "FTDI FT232R",  1,
@@ -100,6 +100,35 @@ static const port_function_t PORT_FUNCTIONS[] = {
 };
 #define PORT_FUNCTIONS_COUNT \
     ((int)(sizeof(PORT_FUNCTIONS) / sizeof(PORT_FUNCTIONS[0])))
+
+/* Map USB product strings to board names.
+ * When multiple boards share the same VID:PID (e.g. FTDI FT4232H),
+ * the USB product string distinguishes them. */
+typedef struct {
+    const char *product;    /* USB product string (substring match) */
+    const char *board;      /* Board name to use */
+} product_board_map_t;
+
+static const product_board_map_t PRODUCT_BOARD_MAP[] = {
+    /* Xilinx/AMD FPGA boards using FTDI FT4232H */
+    { "SCU35",  "SCU35"  },   /* Spartan UltraScale+ */
+    { "VMK180", "VMK180" },   /* Versal VMK180 */
+    { "ZCU102", "ZCU102" },   /* Zynq UltraScale+ ZCU102 */
+};
+#define PRODUCT_BOARD_MAP_COUNT \
+    ((int)(sizeof(PRODUCT_BOARD_MAP) / sizeof(PRODUCT_BOARD_MAP[0])))
+
+static inline const char *
+lookup_board_by_product(const char *product)
+{
+    if (!product || product[0] == '\0')
+        return NULL;
+    for (int i = 0; i < PRODUCT_BOARD_MAP_COUNT; i++) {
+        if (strstr(product, PRODUCT_BOARD_MAP[i].product) != NULL)
+            return PRODUCT_BOARD_MAP[i].board;
+    }
+    return NULL;
+}
 
 static inline const known_device_t *
 lookup_known_device(uint16_t vid, uint16_t pid)

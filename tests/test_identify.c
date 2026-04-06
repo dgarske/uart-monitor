@@ -108,6 +108,37 @@ test_get_device_label_override(void)
 }
 
 static void
+test_lookup_board_by_product(void)
+{
+    TEST("lookup_board_by_product SCU35");
+    const char *board = lookup_board_by_product("SCU35");
+    if (!board) { FAIL("not found"); return; }
+    if (strcmp(board, "SCU35") != 0) { FAIL("wrong board"); return; }
+    PASS();
+}
+
+static void
+test_get_device_label_product_match(void)
+{
+    TEST("get_device_label with product match");
+    tty_port_t port;
+    memset(&port, 0, sizeof(port));
+    strlcpy_safe(port.tty_name, "ttyUSB4", sizeof(port.tty_name));
+    port.known = lookup_known_device(0x0403, 0x6011); /* FT4232H */
+    port.interface_num = 1;
+    port.board_match = lookup_board_by_product("SCU35");
+
+    get_device_label(&port);
+
+    if (strcmp(port.label, "SCU35_UART1") != 0) {
+        printf("\n    got: '%s' expected: 'SCU35_UART1'\n    ", port.label);
+        FAIL("wrong label");
+        return;
+    }
+    PASS();
+}
+
+static void
 test_get_device_label_fallback(void)
 {
     TEST("get_device_label fallback to tty_name");
@@ -177,7 +208,9 @@ int main(void)
     test_lookup_known_device();
     test_lookup_unknown_device();
     test_lookup_port_function();
+    test_lookup_board_by_product();
     test_get_device_label_known();
+    test_get_device_label_product_match();
     test_get_device_label_override();
     test_get_device_label_fallback();
     test_group_ports();
