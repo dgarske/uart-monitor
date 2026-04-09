@@ -327,6 +327,7 @@ load_board_config(board_id_t *ids, int max_ids)
 
     char line[512];
     char current_board[128] = {0};
+    int current_baud = 0;
     int nids = 0;
 
     while (fgets(line, sizeof(line), fp) && nids < max_ids) {
@@ -348,6 +349,15 @@ load_board_config(board_id_t *ids, int max_ids)
                     *(paren - 1) = '\0';
                 }
             }
+            current_baud = 0;
+            continue;
+        }
+
+        /* look for: # Baud: <rate> */
+        if (current_board[0] && strncmp(trimmed, "# Baud:", 7) == 0) {
+            const char *val = trimmed + 7;
+            while (*val == ' ') val++;
+            current_baud = atoi(val);
             continue;
         }
 
@@ -371,6 +381,38 @@ load_board_config(board_id_t *ids, int max_ids)
                                 sizeof(ids[nids].serial));
                     strlcpy_safe(ids[nids].board_name, current_board,
                                 sizeof(ids[nids].board_name));
+                    ids[nids].baud = current_baud;
+                    ids[nids].dev_path[0] = '\0';
+                    nids++;
+                }
+            }
+        }
+
+        /* look for: LABEL=/dev/ttyUSBN  (device path assignment, no S/N) */
+        if (current_board[0] && trimmed[0] != '#' && trimmed[0] != '\n') {
+            char *eq = strchr(trimmed, '=');
+            if (eq && strncmp(eq + 1, "/dev/tty", 8) == 0) {
+                /* extract device path (strip trailing comment/whitespace) */
+                char *devp = eq + 1;
+                char dev[256];
+                int di = 0;
+                while (*devp && *devp != ' ' && *devp != '\t' &&
+                       *devp != '#' && *devp != '\n' &&
+                       di < (int)sizeof(dev) - 1) {
+                    dev[di++] = *devp++;
+                }
+                dev[di] = '\0';
+
+                /* only add if no S/N entry was already added for this board */
+                if (dev[0] && ids[nids > 0 ? nids - 1 : 0].dev_path[0] == '\0'
+                    && (nids == 0 ||
+                        strcmp(ids[nids-1].board_name, current_board) != 0)) {
+                    strlcpy_safe(ids[nids].dev_path, dev,
+                                sizeof(ids[nids].dev_path));
+                    ids[nids].serial[0] = '\0';
+                    strlcpy_safe(ids[nids].board_name, current_board,
+                                sizeof(ids[nids].board_name));
+                    ids[nids].baud = current_baud;
                     nids++;
                 }
             }
@@ -386,11 +428,22 @@ apply_board_config(tty_port_t *ports, int nports,
                    board_id_t *ids, int nids)
 {
     for (int i = 0; i < nports; i++) {
-        if (ports[i].serial[0] == '\0')
-            continue;
         for (int j = 0; j < nids; j++) {
-            if (strcmp(ports[i].serial, ids[j].serial) == 0) {
+            int match = 0;
+            /* match by serial number */
+            if (ids[j].serial[0] && ports[i].serial[0] &&
+                strcmp(ports[i].serial, ids[j].serial) == 0) {
+                match = 1;
+            }
+            /* match by device path */
+            if (ids[j].dev_path[0] &&
+                strcmp(ports[i].dev_path, ids[j].dev_path) == 0) {
+                match = 1;
+            }
+            if (match) {
                 ports[i].board_override = ids[j].board_name;
+                if (ids[j].baud > 0)
+                    ports[i].baud = ids[j].baud;
                 /* regenerate label with the board override */
                 get_device_label(&ports[i]);
                 break;

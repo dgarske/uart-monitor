@@ -43,6 +43,7 @@ typedef struct {
     const char *board_override;
     const char *board_match;   /* from USB product string match */
     char label[64];      /* filesystem-safe name, e.g. "VMK180_UART1" */
+    int  baud;           /* per-device baud rate override (0 = use global) */
 } tty_port_t;
 
 typedef struct {
@@ -55,6 +56,8 @@ typedef struct {
 typedef struct {
     char serial[64];
     char board_name[128];
+    int  baud;           /* per-board baud rate (0 = use global default) */
+    char dev_path[256];  /* optional: match by device path instead of S/N */
 } board_id_t;
 
 #define MAX_BOARD_IDS 32

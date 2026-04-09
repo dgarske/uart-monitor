@@ -254,12 +254,14 @@ add_port(monitor_state_t *state, tty_port_t *identity)
     mp->serial.pty_master = -1;
 
     /* open serial port (proxy or read-only) */
+    speed_t baud = (identity->baud > 0)
+                   ? baud_to_speed(identity->baud)
+                   : state->baudrate;
     int rc;
     if (state->proxy_mode)
-        rc = serial_open_proxy(&mp->serial, identity->dev_path,
-                               state->baudrate);
+        rc = serial_open_proxy(&mp->serial, identity->dev_path, baud);
     else
-        rc = serial_open(&mp->serial, identity->dev_path, state->baudrate);
+        rc = serial_open(&mp->serial, identity->dev_path, baud);
 
     if (rc < 0)
         return -1;
@@ -279,7 +281,7 @@ add_port(monitor_state_t *state, tty_port_t *identity)
              identity->dev_path, identity->label,
              board, identity->interface_num,
              identity->function_name ? identity->function_name : "Unknown",
-             115200);
+             identity->baud > 0 ? identity->baud : 115200);
 
     /* open log file -- use label as filename for human-friendly names */
     if (log_open(&mp->log, state->session_path,
@@ -502,12 +504,15 @@ reclaim_port(monitor_state_t *state, int idx, char *resp, size_t resp_sz)
         return;
     }
 
-    /* reconfigure termios */
+    /* reconfigure termios (use per-device baud if set) */
+    speed_t reclaim_baud = (mp->identity.baud > 0)
+                           ? baud_to_speed(mp->identity.baud)
+                           : state->baudrate;
     struct termios tty;
     memset(&tty, 0, sizeof(tty));
-    cfsetispeed(&tty, state->baudrate);
-    cfsetospeed(&tty, state->baudrate);
-    tty.c_cflag = state->baudrate | CS8 | CREAD | CLOCAL;
+    cfsetispeed(&tty, reclaim_baud);
+    cfsetospeed(&tty, reclaim_baud);
+    tty.c_cflag = reclaim_baud | CS8 | CREAD | CLOCAL;
     tty.c_iflag = 0;
     tty.c_oflag = 0;
     tty.c_lflag = 0;
