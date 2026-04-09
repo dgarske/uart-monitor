@@ -445,8 +445,11 @@ apply_board_config(tty_port_t *ports, int nports,
                 /* For device-path-only matches, verify compatibility with
                  * VID:PID.  Device paths are unstable and shift when devices
                  * are added or removed, so a stale path can point to the
-                 * wrong device.  Serial-number matches are authoritative. */
-                if (!match_by_serial && ports[i].known) {
+                 * wrong device.  Serial-number matches are authoritative.
+                 * Skip this check when the board config has a custom baud
+                 * rate -- the user explicitly assigned this device path. */
+                if (!match_by_serial && ports[i].known &&
+                    ids[j].baud == 0) {
                     int compat = 0;
                     for (int b = 0; b < MAX_BOARDS_PER_DEVICE &&
                                     ports[i].known->boards[b]; b++) {

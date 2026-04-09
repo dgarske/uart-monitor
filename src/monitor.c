@@ -651,6 +651,44 @@ handle_control_cmd(monitor_state_t *state, int client_fd)
                 clear_port_log(state, idx, resp, sizeof(resp));
             }
         }
+    } else if (strncmp(buf, "BAUD ", 5) == 0) {
+        /* BAUD <device|label> <rate> -- change baud rate on a running port */
+        char name[256];
+        int rate = 0;
+        if (sscanf(buf + 5, "%255s %d", name, &rate) != 2 || rate <= 0) {
+            snprintf(resp, sizeof(resp),
+                     "ERROR usage: BAUD <device|label> <rate>\n");
+        } else {
+            int idx = find_port_by_name(state, name);
+            if (idx < 0)
+                idx = find_port_by_path(state, name);
+            if (idx < 0) {
+                snprintf(resp, sizeof(resp),
+                         "ERROR port not found: %s\n", name);
+            } else {
+                monitored_port_t *mp = &state->ports[idx];
+                speed_t spd = baud_to_speed(rate);
+                if (spd == B0) {
+                    snprintf(resp, sizeof(resp),
+                             "ERROR unsupported baud rate: %d\n", rate);
+                } else {
+                    struct termios tty;
+                    if (tcgetattr(mp->serial.fd, &tty) == 0) {
+                        cfsetispeed(&tty, spd);
+                        cfsetospeed(&tty, spd);
+                        tty.c_cflag = (tty.c_cflag & ~CBAUD) | spd;
+                        tcsetattr(mp->serial.fd, TCSANOW, &tty);
+                        mp->identity.baud = rate;
+                        snprintf(resp, sizeof(resp),
+                                 "OK baud %d on %s\n", rate,
+                                 mp->identity.dev_path);
+                    } else {
+                        snprintf(resp, sizeof(resp),
+                                 "ERROR tcgetattr: %s\n", strerror(errno));
+                    }
+                }
+            }
+        }
     } else if (strcmp(buf, "QUIT") == 0) {
         snprintf(resp, sizeof(resp), "OK shutting down\n");
         state->running = 0;

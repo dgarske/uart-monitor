@@ -172,6 +172,21 @@ cmd_clear(int argc, char *argv[])
 }
 
 int
+cmd_baud(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: uart-monitor baud <device|label> <rate>\n");
+        fprintf(stderr, "Examples:\n");
+        fprintf(stderr, "  uart-monitor baud /dev/ttyUSB14 9600\n");
+        fprintf(stderr, "  uart-monitor baud ttyUSB14 9600\n");
+        return 1;
+    }
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "BAUD %s %s\n", argv[1], argv[2]);
+    return control_send_cmd(CONTROL_SOCK_PATH, cmd);
+}
+
+int
 cmd_tail(int argc, char *argv[])
 {
     if (argc < 2) {

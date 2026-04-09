@@ -83,6 +83,8 @@ main(int argc, char *argv[])
         return cmd_reclaim(argc - 1, argv + 1);
     if (strcmp(cmd, "clear") == 0)
         return cmd_clear(argc - 1, argv + 1);
+    if (strcmp(cmd, "baud") == 0)
+        return cmd_baud(argc - 1, argv + 1);
     if (strcmp(cmd, "tail") == 0)
         return cmd_tail(argc - 1, argv + 1);
     if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {

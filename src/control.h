@@ -40,6 +40,7 @@ int cmd_status(int argc, char *argv[]);
 int cmd_yield(int argc, char *argv[]);
 int cmd_reclaim(int argc, char *argv[]);
 int cmd_clear(int argc, char *argv[]);
+int cmd_baud(int argc, char *argv[]);
 int cmd_tail(int argc, char *argv[]);
 
 #endif /* CONTROL_H */
