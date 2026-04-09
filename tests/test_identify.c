@@ -159,6 +159,70 @@ test_get_device_label_fallback(void)
 }
 
 static void
+test_apply_board_config_path_mismatch(void)
+{
+    TEST("apply_board_config rejects stale path");
+    tty_port_t ports[1];
+    memset(ports, 0, sizeof(ports));
+
+    /* NXP LPC-Link2 device on /dev/ttyACM0 */
+    ports[0].vid = 0x1fc9;
+    ports[0].pid = 0x0090;
+    ports[0].known = lookup_known_device(0x1fc9, 0x0090);
+    strlcpy_safe(ports[0].dev_path, "/dev/ttyACM0", sizeof(ports[0].dev_path));
+    strlcpy_safe(ports[0].tty_name, "ttyACM0", sizeof(ports[0].tty_name));
+    ports[0].interface_num = 1;
+
+    /* Config says /dev/ttyACM0 is STM32H563 (stale entry) */
+    board_id_t ids[1];
+    memset(ids, 0, sizeof(ids));
+    strlcpy_safe(ids[0].dev_path, "/dev/ttyACM0", sizeof(ids[0].dev_path));
+    strlcpy_safe(ids[0].board_name, "STM32H563", sizeof(ids[0].board_name));
+
+    apply_board_config(ports, 1, ids, 1);
+
+    if (ports[0].board_override != NULL) {
+        printf("\n    got override: '%s', expected NULL\n    ",
+               ports[0].board_override);
+        FAIL("should not apply mismatched board override");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_apply_board_config_serial_match(void)
+{
+    TEST("apply_board_config allows serial match");
+    tty_port_t ports[1];
+    memset(ports, 0, sizeof(ports));
+
+    /* NXP LPC-Link2 device with a serial number */
+    ports[0].vid = 0x1fc9;
+    ports[0].pid = 0x0090;
+    ports[0].known = lookup_known_device(0x1fc9, 0x0090);
+    strlcpy_safe(ports[0].serial, "EQAQBQLQ", sizeof(ports[0].serial));
+    strlcpy_safe(ports[0].dev_path, "/dev/ttyACM0", sizeof(ports[0].dev_path));
+    strlcpy_safe(ports[0].tty_name, "ttyACM0", sizeof(ports[0].tty_name));
+    ports[0].interface_num = 1;
+
+    /* Config matches by serial — should override even if board doesn't match */
+    board_id_t ids[1];
+    memset(ids, 0, sizeof(ids));
+    strlcpy_safe(ids[0].serial, "EQAQBQLQ", sizeof(ids[0].serial));
+    strlcpy_safe(ids[0].board_name, "CustomBoard", sizeof(ids[0].board_name));
+
+    apply_board_config(ports, 1, ids, 1);
+
+    if (ports[0].board_override == NULL ||
+        strcmp(ports[0].board_override, "CustomBoard") != 0) {
+        FAIL("serial match should allow any board override");
+        return;
+    }
+    PASS();
+}
+
+static void
 test_group_ports(void)
 {
     TEST("group_ports groups by VID:PID:serial");
@@ -213,6 +277,8 @@ int main(void)
     test_get_device_label_product_match();
     test_get_device_label_override();
     test_get_device_label_fallback();
+    test_apply_board_config_path_mismatch();
+    test_apply_board_config_serial_match();
     test_group_ports();
 
     printf("\n  Results: %d passed, %d failed\n\n",

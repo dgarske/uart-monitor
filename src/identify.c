@@ -429,11 +429,12 @@ apply_board_config(tty_port_t *ports, int nports,
 {
     for (int i = 0; i < nports; i++) {
         for (int j = 0; j < nids; j++) {
-            int match = 0;
+            int match = 0, match_by_serial = 0;
             /* match by serial number */
             if (ids[j].serial[0] && ports[i].serial[0] &&
                 strcmp(ports[i].serial, ids[j].serial) == 0) {
                 match = 1;
+                match_by_serial = 1;
             }
             /* match by device path */
             if (ids[j].dev_path[0] &&
@@ -441,6 +442,23 @@ apply_board_config(tty_port_t *ports, int nports,
                 match = 1;
             }
             if (match) {
+                /* For device-path-only matches, verify compatibility with
+                 * VID:PID.  Device paths are unstable and shift when devices
+                 * are added or removed, so a stale path can point to the
+                 * wrong device.  Serial-number matches are authoritative. */
+                if (!match_by_serial && ports[i].known) {
+                    int compat = 0;
+                    for (int b = 0; b < MAX_BOARDS_PER_DEVICE &&
+                                    ports[i].known->boards[b]; b++) {
+                        if (strcmp(ports[i].known->boards[b],
+                                  ids[j].board_name) == 0) {
+                            compat = 1;
+                            break;
+                        }
+                    }
+                    if (!compat)
+                        continue;   /* stale path – skip */
+                }
                 ports[i].board_override = ids[j].board_name;
                 if (ids[j].baud > 0)
                     ports[i].baud = ids[j].baud;
