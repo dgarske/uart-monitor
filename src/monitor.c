@@ -136,6 +136,9 @@ pty_remove_symlink(const char *label)
     unlink(link);
 }
 
+/* forward declaration -- defined further down */
+static int find_port_by_path(monitor_state_t *state, const char *dev_path);
+
 /* ------------------------------------------------------------------ */
 /*  Status JSON                                                       */
 /* ------------------------------------------------------------------ */
@@ -192,6 +195,55 @@ write_status_json(monitor_state_t *state)
         fprintf(fp, "      \"bytes_logged\": %zu\n", mp->log.bytes_written);
         fprintf(fp, "    }%s\n",
                 (i < state->port_count - 1) ? "," : "");
+    }
+
+    fprintf(fp, "  ],\n");
+
+    /* scan all ports and include those not currently monitored */
+    tty_port_t all_ports[MAX_PORTS];
+    int nall = scan_all_ports(all_ports, MAX_PORTS);
+    board_id_t bids[MAX_BOARD_IDS];
+    int nbids = load_board_config(bids, MAX_BOARD_IDS);
+    if (nbids > 0)
+        apply_board_config(all_ports, nall, bids, nbids);
+
+    /* count non-monitored ports */
+    int n_identified = 0;
+    for (int i = 0; i < nall; i++) {
+        if (find_port_by_path(state, all_ports[i].dev_path) < 0)
+            n_identified++;
+    }
+
+    fprintf(fp, "  \"total_ports\": %d,\n",
+            state->port_count + n_identified);
+    fprintf(fp, "  \"identified_ports\": [\n");
+
+    int written = 0;
+    for (int i = 0; i < nall; i++) {
+        if (find_port_by_path(state, all_ports[i].dev_path) >= 0)
+            continue; /* already in "ports" array */
+
+        tty_port_t *p = &all_ports[i];
+        const char *board = "Unknown";
+        if (p->board_override)
+            board = p->board_override;
+        else if (p->board_match)
+            board = p->board_match;
+        else if (p->known && p->known->boards[0])
+            board = p->known->boards[0];
+
+        const char *func = p->function_name ? p->function_name : "Unknown";
+
+        fprintf(fp, "    {\n");
+        fprintf(fp, "      \"device\": \"%s\",\n", p->dev_path);
+        fprintf(fp, "      \"label\": \"%s\",\n", p->label);
+        fprintf(fp, "      \"board\": \"%s\",\n", board);
+        fprintf(fp, "      \"function\": \"%s\",\n", func);
+        fprintf(fp, "      \"vid\": \"%04x\",\n", p->vid);
+        fprintf(fp, "      \"pid\": \"%04x\",\n", p->pid);
+        fprintf(fp, "      \"status\": \"not_monitored\"\n");
+        fprintf(fp, "    }%s\n",
+                (++written < n_identified) ? "," : "");
     }
 
     fprintf(fp, "  ]\n}\n");
