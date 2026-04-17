@@ -152,8 +152,21 @@ tail -f /tmp/uart-monitor/latest/POLARFIRE_SOC_UART0.log
 
 The daemon auto-identifies boards by USB VID:PID via sysfs:
 VMK180, ZCU102, PolarFire SoC, NXP LPC54S018M-EVK (LPC-Link2), STM32H563,
-STM32N657 (STLINK-V3), FTDI (FT232/FT2232/FT4232), CP210x, CH340, PL2303,
-Cypress FX3. Board overrides from `~/.boards`.
+STM32N657 / STM32U3 / STM32C5A3 (all STLINK-V3), FTDI (FT232/FT2232/FT4232),
+CP210x, CH340, PL2303, Cypress FX3. Board overrides from `~/.boards`.
+
+### STLINK-V3 disambiguation
+
+STM32 boards using the STLINK-V3 debugger share a single USB PID
+(`0x0483:0x3754`). To tell them apart, `uart-monitor identify` shells out
+to `st-info --probe` (from `stlink-tools`) and maps the DBGMCU chipid
+to the MCU family (e.g. `0x454` → STM32U3, `0x484` → STM32H563,
+`0x505` → STM32N657). Install with `sudo apt install stlink-tools`.
+
+If `st-info` isn't installed, ports fall back to the generic label
+`STM32_STLINK_V3_UART` rather than guessing a specific family. To force
+a specific name, add the board to `~/.boards` keyed by serial number —
+this always overrides the auto-detected label.
 
 ## Architecture
 

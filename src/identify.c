@@ -30,7 +30,163 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+
+/* -------------------------------------------------------------------- */
+/* ST-LINK chipid probe                                                 */
+/*                                                                      */
+/* The STLINK-V3 USB VID:PID (0x0483:0x3754) is shared by many STM32    */
+/* families (U3, N6, C5, H5, ...). USB descriptors do not differentiate */
+/* them. When we encounter an "ambiguous" known_device, shell out to    */
+/* `st-info --probe` (stlink-tools) which reads the DBGMCU IDCODE and   */
+/* returns a chipid that uniquely identifies the MCU family. Results    */
+/* are cached per scan so multiple ttys / multiple STLINK units don't   */
+/* spawn multiple subprocesses.                                         */
+/* -------------------------------------------------------------------- */
+
+typedef struct {
+    char serial[64];
+    uint32_t chipid;
+} stlink_probe_entry_t;
+
+#define STLINK_PROBE_CACHE_SZ 8
+#define STLINK_PROBE_CACHE_TTL_SEC 2
+static stlink_probe_entry_t stlink_probe_cache[STLINK_PROBE_CACHE_SZ];
+static int stlink_probe_cache_count = 0;
+static int stlink_probe_cache_populated = 0;
+static time_t stlink_probe_cache_time = 0;
+
+/* Arena for probe-derived board names. The tty_port_t->board_match field
+ * is `const char *` and expects pointers that live for the process, so
+ * we can't hand out stack buffers. */
+#define PROBE_NAME_ARENA_SZ 256
+static char probe_name_arena[PROBE_NAME_ARENA_SZ];
+static size_t probe_name_arena_used = 0;
+
+static const char *
+intern_board_name(const char *name)
+{
+    if (!name)
+        return NULL;
+    size_t need = strlen(name) + 1;
+    if (probe_name_arena_used + need > sizeof(probe_name_arena))
+        return NULL;
+    char *slot = probe_name_arena + probe_name_arena_used;
+    memcpy(slot, name, need);
+    probe_name_arena_used += need;
+    return slot;
+}
+
+/* Reset cache at the start of each full scan (see scan_all_ports). */
+static void
+stlink_probe_cache_reset(void)
+{
+    stlink_probe_cache_count = 0;
+    stlink_probe_cache_populated = 0;
+    stlink_probe_cache_time = 0;
+}
+
+/* Populate the cache by running `st-info --probe` once. Returns 0 on
+ * success (including the case of zero programmers found), -1 if the
+ * subprocess failed (tool missing, exec error, non-zero exit). */
+static int
+stlink_probe_cache_populate(void)
+{
+    time_t now = time(NULL);
+    if (stlink_probe_cache_populated &&
+        now - stlink_probe_cache_time < STLINK_PROBE_CACHE_TTL_SEC)
+        return 0;
+
+    /* (re)populate: clear prior state first */
+    stlink_probe_cache_count = 0;
+    stlink_probe_cache_populated = 1;
+    stlink_probe_cache_time = now;
+
+    FILE *fp = popen("st-info --probe 2>/dev/null", "r");
+    if (!fp)
+        return -1;
+
+    char line[256];
+    char cur_serial[64] = {0};
+    uint32_t cur_chipid = 0;
+    int have_chipid = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* trim leading whitespace */
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (strncmp(p, "serial:", 7) == 0) {
+            /* flush previous block if complete */
+            if (cur_serial[0] && have_chipid &&
+                stlink_probe_cache_count < STLINK_PROBE_CACHE_SZ) {
+                strlcpy_safe(stlink_probe_cache[stlink_probe_cache_count]
+                                 .serial, cur_serial, 64);
+                stlink_probe_cache[stlink_probe_cache_count].chipid =
+                    cur_chipid;
+                stlink_probe_cache_count++;
+            }
+            cur_serial[0] = '\0';
+            have_chipid = 0;
+            cur_chipid = 0;
+
+            const char *v = p + 7;
+            while (*v == ' ' || *v == '\t') v++;
+            int i = 0;
+            while (*v && *v != '\n' && *v != '\r' && *v != ' ' &&
+                   i < (int)sizeof(cur_serial) - 1) {
+                cur_serial[i++] = *v++;
+            }
+            cur_serial[i] = '\0';
+        }
+        else if (strncmp(p, "chipid:", 7) == 0) {
+            const char *v = p + 7;
+            while (*v == ' ' || *v == '\t') v++;
+            cur_chipid = (uint32_t)strtoul(v, NULL, 0);
+            have_chipid = 1;
+        }
+    }
+
+    /* flush trailing block */
+    if (cur_serial[0] && have_chipid &&
+        stlink_probe_cache_count < STLINK_PROBE_CACHE_SZ) {
+        strlcpy_safe(stlink_probe_cache[stlink_probe_cache_count].serial,
+                     cur_serial, 64);
+        stlink_probe_cache[stlink_probe_cache_count].chipid = cur_chipid;
+        stlink_probe_cache_count++;
+    }
+
+    int rc = pclose(fp);
+    if (rc == -1)
+        return -1;
+    /* st-info returns 0 on success; tolerate non-zero only if we parsed
+     * at least one entry (some older builds exit non-zero on partial). */
+    if (rc != 0 && stlink_probe_cache_count == 0)
+        return -1;
+    return 0;
+}
+
+/* Look up the board name for a given STLINK serial by probing.
+ * Returns 0 + fills board_out on success, -1 if not found / probe failed. */
+static int
+probe_stlink_chipid(const char *serial, char *board_out, size_t board_sz)
+{
+    if (!serial || !serial[0])
+        return -1;
+    if (stlink_probe_cache_populate() < 0)
+        return -1;
+    for (int i = 0; i < stlink_probe_cache_count; i++) {
+        if (strcmp(stlink_probe_cache[i].serial, serial) != 0)
+            continue;
+        const char *b = lookup_board_by_chipid(stlink_probe_cache[i].chipid);
+        if (!b)
+            return -1;
+        strlcpy_safe(board_out, b, board_sz);
+        return 0;
+    }
+    return -1;
+}
 
 /* Extract the USB bus path (e.g. "1-6.2") from a sysfs device path.
  * Looks for pattern /usbN/<path>/ in the resolved sysfs path. */
@@ -155,6 +311,18 @@ identify_port(const char *dev_path, tty_port_t *port)
     /* try to match board by USB product string */
     port->board_match = lookup_board_by_product(port->product);
 
+    /* For ambiguous devices (VID:PID shared by multiple MCU families
+     * like the STLINK-V3), probe the debug interface to resolve the
+     * actual chip. Only runs if the user hasn't already matched by
+     * product string. Best-effort: silently falls through if st-info
+     * is missing or the probe fails. */
+    if (port->known && !port->board_match && port->serial[0] &&
+        known_device_is_ambiguous(port->known)) {
+        char probed[48];
+        if (probe_stlink_chipid(port->serial, probed, sizeof(probed)) == 0)
+            port->board_match = intern_board_name(probed);
+    }
+
     /* determine function name */
     if (port->known) {
         port->function_name =
@@ -181,6 +349,9 @@ scan_all_ports(tty_port_t *ports, int max_ports)
     int n = 0;
 
     memset(&g, 0, sizeof(g));
+
+    /* Reset per-scan probe cache so stale hotplug state doesn't leak. */
+    stlink_probe_cache_reset();
 
     glob("/dev/ttyUSB*",  flags, NULL, &g);
     flags |= GLOB_APPEND;
@@ -227,6 +398,21 @@ get_device_label(tty_port_t *port)
             snprintf(port->label, sizeof(port->label),
                      "%.48s_UART", clean);
         }
+        return;
+    }
+
+    /* Ambiguous device (multiple candidate boards share this VID:PID):
+     * if we weren't able to resolve it via product-string / probe, use
+     * the device name instead of arbitrarily picking boards[0]. E.g.
+     * STLINK-V3 with unknown chipid -> STM32_STLINK_V3_UART. */
+    if (known_device_is_ambiguous(port->known)) {
+        char clean[48];
+        strlcpy_safe(clean, port->known->name, sizeof(clean));
+        for (char *p = clean; *p; p++) {
+            if (*p == ' ' || *p == '-') *p = '_';
+            if (*p >= 'a' && *p <= 'z') *p -= 32;
+        }
+        snprintf(port->label, sizeof(port->label), "%.48s_UART", clean);
         return;
     }
 

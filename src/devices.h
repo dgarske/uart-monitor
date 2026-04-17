@@ -71,7 +71,7 @@ static const known_device_t KNOWN_DEVICES[] = {
     { 0x0483, 0x374e, "STM32 Virtual COM Port", 1,
       { "STM32H563", NULL, NULL, NULL } },
     { 0x0483, 0x3754, "STM32 STLINK-V3",       1,
-      { "STM32N657", "STM32C5A3", "STM32 boards", NULL } },
+      { "STM32U3", "STM32N657", "STM32C5A3", "STM32 boards" } },
     { 0x0483, 0x5740, "STM32 USB CDC",          1,
       { "USB Relay Controller", NULL, NULL, NULL } },
 
@@ -152,6 +152,57 @@ lookup_port_function(const char *device_name, int interface_num)
         }
     }
     return NULL;
+}
+
+/* Map DBGMCU IDCODE (DEV_ID, low 12 bits) to STM32 family name.
+ * Used to differentiate STM32 variants sharing the STLINK-V3 PID
+ * (0x0483:0x3754) by actively probing via `st-info --probe`. */
+typedef struct {
+    uint32_t    chipid;
+    const char *board;
+} stm32_chipid_map_t;
+
+static const stm32_chipid_map_t STM32_CHIPID_MAP[] = {
+    { 0x454, "STM32U3"   },   /* confirmed on STM32U3 NUCLEO */
+    { 0x455, "STM32U3"   },   /* alt ID reported by some variants */
+    { 0x482, "STM32U5"   },
+    { 0x484, "STM32H563" },
+    { 0x505, "STM32N657" },
+};
+#define STM32_CHIPID_MAP_COUNT \
+    ((int)(sizeof(STM32_CHIPID_MAP) / sizeof(STM32_CHIPID_MAP[0])))
+
+static inline const char *
+lookup_board_by_chipid(uint32_t chipid)
+{
+    for (int i = 0; i < STM32_CHIPID_MAP_COUNT; i++) {
+        if (STM32_CHIPID_MAP[i].chipid == chipid)
+            return STM32_CHIPID_MAP[i].board;
+    }
+    return NULL;
+}
+
+/* A known_device is "ambiguous" when its boards[] array lists more than
+ * one specific board name (excluding generic fallbacks). In that case,
+ * picking boards[0] arbitrarily would mislabel other variants — the
+ * caller should probe (e.g. via st-info) to resolve the actual board. */
+static inline int
+known_device_is_ambiguous(const known_device_t *dev)
+{
+    if (!dev)
+        return 0;
+    int specific = 0;
+    for (int b = 0; b < MAX_BOARDS_PER_DEVICE && dev->boards[b]; b++) {
+        const char *n = dev->boards[b];
+        if (strcmp(n, "Generic") == 0)
+            continue;
+        if (strstr(n, " boards") != NULL)
+            continue;
+        if (strstr(n, "Various") != NULL)
+            continue;
+        specific++;
+    }
+    return specific >= 2;
 }
 
 #endif /* DEVICES_H */
