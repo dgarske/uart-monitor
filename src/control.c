@@ -233,10 +233,12 @@ cmd_tail(int argc, char *argv[])
         return 1;
     }
 
-    printf("Tailing %s (Ctrl-C to stop)...\n\n", logpath);
-    fflush(stdout);
-
-    char tailcmd[600];
-    snprintf(tailcmd, sizeof(tailcmd), "tail -f '%s'", logpath);
-    return system(tailcmd);
+    /* exec directly into tail so the running process is just tail
+     * (no waiting parent, no /bin/sh in between, signals and exit
+     * code propagate cleanly). */
+    char *tail_argv[] = { (char *)"tail", (char *)"-f", logpath, NULL };
+    execvp("tail", tail_argv);
+    /* execvp returns only on failure */
+    fprintf(stderr, "execvp tail: %s\n", strerror(errno));
+    return 1;
 }
