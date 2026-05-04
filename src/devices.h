@@ -57,11 +57,16 @@ static const known_device_t KNOWN_DEVICES[] = {
     { 0x04b4, 0x0008, "Cypress FX3",  4, 0,
       { "Versal VMK180", "ZCU102", NULL, NULL } },
 
-    /* Microchip PolarFire SoC */
+    /* Silicon Labs CP210x bridges.
+     * 0xea71 (CP2108, 4-port) is used on the Microchip PolarFire SoC
+     * Icicle/Discovery kits. 0xea60 (CP2102/CP2103, single-port) is a
+     * generic UART bridge shipped on many unrelated adapters (ZC702,
+     * vendor dev kits, no-name USB-serial dongles); it should default
+     * to "Generic" and be disambiguated via ~/.boards. */
     { 0x10c4, 0xea71, "Silicon Labs CP210x", 4, 0,
       { "PolarFire SoC", NULL, NULL, NULL } },
     { 0x10c4, 0xea60, "Silicon Labs CP210x", 1, 0,
-      { "PolarFire SoC", "Generic", NULL, NULL } },
+      { "Generic", "ZC702", "PolarFire SoC", NULL } },
 
     /* NXP */
     { 0x1fc9, 0x0090, "NXP LPC-Link2 CMSIS-DAP", 1, 0,
