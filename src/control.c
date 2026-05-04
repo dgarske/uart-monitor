@@ -102,18 +102,30 @@ control_send_cmd(const char *sock_path, const char *cmd)
         return -1;
     }
 
-    /* read response */
+    /* read response. Loop because Unix-socket reads can short-return
+     * with payloads larger than the kernel buffer (~16 KB default). */
     char buf[CONTROL_MAX_MSG];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    if (n > 0) {
-        buf[n] = '\0';
+    size_t total = 0;
+    while (total < sizeof(buf) - 1) {
+        ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break;
+        total += (size_t)n;
+    }
+    if (total > 0) {
+        buf[total] = '\0';
         printf("%s", buf);
-        if (buf[n - 1] != '\n')
+        if (buf[total - 1] != '\n')
             printf("\n");
     }
 
     close(fd);
-    return (n > 0 && strncmp(buf, "OK", 2) == 0) ? 0 : 1;
+    return (total > 0 && strncmp(buf, "OK", 2) == 0) ? 0 : 1;
 }
 
 int

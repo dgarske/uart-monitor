@@ -59,8 +59,8 @@ static time_t stlink_probe_cache_time = 0;
 
 /* Arena for probe-derived board names. The tty_port_t->board_match field
  * is `const char *` and expects pointers that live for the process, so
- * we can't hand out stack buffers. */
-#define PROBE_NAME_ARENA_SZ 256
+ * we can't hand out stack buffers. Sized for ~16 NUCLEO-* names. */
+#define PROBE_NAME_ARENA_SZ 1024
 static char probe_name_arena[PROBE_NAME_ARENA_SZ];
 static size_t probe_name_arena_used = 0;
 
@@ -78,13 +78,17 @@ intern_board_name(const char *name)
     return slot;
 }
 
-/* Reset cache at the start of each full scan (see scan_all_ports). */
+/* Forward decl: defined below the STM32CubeProgrammer probe block. */
+static void stm32_prog_cache_reset(void);
+
+/* Reset caches at the start of each full scan (see scan_all_ports). */
 static void
 stlink_probe_cache_reset(void)
 {
     stlink_probe_cache_count = 0;
     stlink_probe_cache_populated = 0;
     stlink_probe_cache_time = 0;
+    stm32_prog_cache_reset();
 }
 
 /* Populate the cache by running `st-info --probe` once. Returns 0 on
@@ -184,6 +188,256 @@ probe_stlink_chipid(const char *serial, char *board_out, size_t board_sz)
             return -1;
         strlcpy_safe(board_out, b, board_sz);
         return 0;
+    }
+    return -1;
+}
+
+/* -------------------------------------------------------------------- */
+/* STM32CubeProgrammer CLI probe                                        */
+/*                                                                      */
+/* `STM32_Programmer_CLI --list` reads the board name directly from     */
+/* the ST-LINK firmware EEPROM (no SWD transaction required) and        */
+/* returns full NUCLEO names (e.g. "NUCLEO-U575ZI-Q"). Far more robust  */
+/* than st-info DBGMCU IDCODE probing because it works even when the    */
+/* target MCU is held in reset, in low-power, or has no firmware.       */
+/* When the CLI is not installed we silently fall back to st-info.      */
+/* -------------------------------------------------------------------- */
+
+typedef struct {
+    char serial[64];
+    char board[64];
+} stm32_prog_entry_t;
+
+#define STM32_PROG_CACHE_SZ 16
+static stm32_prog_entry_t stm32_prog_cache[STM32_PROG_CACHE_SZ];
+static int stm32_prog_cache_count = 0;
+static int stm32_prog_cache_populated = 0;
+
+/* Path to STM32_Programmer_CLI, found once per process and cached.
+ * Empty string = not installed (negative cache). */
+static char stm32_prog_cli_path[512] = {0};
+static int stm32_prog_cli_searched = 0;
+
+static void
+stm32_prog_cache_reset(void)
+{
+    stm32_prog_cache_count = 0;
+    stm32_prog_cache_populated = 0;
+    /* don't reset the path cache -- the binary location doesn't move */
+}
+
+/* Try a candidate path and return 1 if it's executable. */
+static int
+try_cli_path(const char *path)
+{
+    if (!path || !path[0])
+        return 0;
+    if (access(path, X_OK) != 0)
+        return 0;
+    strlcpy_safe(stm32_prog_cli_path, path, sizeof(stm32_prog_cli_path));
+    return 1;
+}
+
+/* Locate STM32_Programmer_CLI. Returns path or NULL if not installed.
+ * Search order:
+ *   1. $STM32_PROGRAMMER_CLI environment override
+ *   2. $PATH (via "command -v")
+ *   3. ~/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/...
+ *   4. /opt/STMicroelectronics/.../bin/...
+ *   5. /usr/local/STMicroelectronics/.../bin/... */
+static const char *
+find_stm32_programmer_cli(void)
+{
+    if (stm32_prog_cli_searched)
+        return stm32_prog_cli_path[0] ? stm32_prog_cli_path : NULL;
+    stm32_prog_cli_searched = 1;
+
+    const char *env = getenv("STM32_PROGRAMMER_CLI");
+    if (try_cli_path(env))
+        return stm32_prog_cli_path;
+
+    /* $PATH lookup via popen("command -v ...") */
+    FILE *fp = popen("command -v STM32_Programmer_CLI 2>/dev/null", "r");
+    if (fp) {
+        char buf[512];
+        if (fgets(buf, sizeof(buf), fp)) {
+            char *nl = strchr(buf, '\n');
+            if (nl) *nl = '\0';
+            if (try_cli_path(buf)) {
+                pclose(fp);
+                return stm32_prog_cli_path;
+            }
+        }
+        pclose(fp);
+    }
+
+    /* Common install dirs */
+    const char *home = getenv("HOME");
+    if (home) {
+        char candidate[512];
+        snprintf(candidate, sizeof(candidate),
+                 "%s/STMicroelectronics/STM32Cube/STM32CubeProgrammer"
+                 "/bin/STM32_Programmer_CLI", home);
+        if (try_cli_path(candidate))
+            return stm32_prog_cli_path;
+    }
+    if (try_cli_path("/opt/STMicroelectronics/STM32Cube/"
+                     "STM32CubeProgrammer/bin/STM32_Programmer_CLI"))
+        return stm32_prog_cli_path;
+    if (try_cli_path("/usr/local/STMicroelectronics/STM32Cube/"
+                     "STM32CubeProgrammer/bin/STM32_Programmer_CLI"))
+        return stm32_prog_cli_path;
+
+    return NULL;   /* not installed */
+}
+
+/* Strip ANSI CSI escape sequences (ESC '[' ... letter) in place.
+ * STM32_Programmer_CLI emits color codes by default; we don't want
+ * them in our parsed strings. */
+static void
+strip_ansi(char *s)
+{
+    char *r = s;
+    char *w = s;
+    while (*r) {
+        if (*r == 0x1b && r[1] == '[') {
+            r += 2;
+            while (*r && !((*r >= 'A' && *r <= 'Z') ||
+                           (*r >= 'a' && *r <= 'z')))
+                r++;
+            if (*r) r++;
+            continue;
+        }
+        *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+/* Trim leading whitespace and trailing whitespace/CR/LF in place. */
+static void
+trim_inplace(char *s)
+{
+    char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                       s[len - 1] == '\r' || s[len - 1] == '\n'))
+        s[--len] = '\0';
+}
+
+/* Populate per-S/N board name table by running STM32_Programmer_CLI.
+ * Returns 0 on success (incl. zero entries), -1 if the CLI is not
+ * installed or the subprocess failed. */
+static int
+stm32_prog_cache_populate(void)
+{
+    if (stm32_prog_cache_populated)
+        return stm32_prog_cache_count > 0 ? 0 : -1;
+    stm32_prog_cache_populated = 1;
+    stm32_prog_cache_count = 0;
+
+    const char *cli = find_stm32_programmer_cli();
+    if (!cli)
+        return -1;
+
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "\"%s\" --list 2>/dev/null", cli);
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return -1;
+
+    char line[512];
+    char cur_serial[64] = {0};
+    char cur_board[64] = {0};
+    int in_probe_block = 0;
+
+    /* Helper macro: flush partial block into cache if complete. */
+    #define STM32_PROG_FLUSH() do {                                  \
+        if (cur_serial[0] && cur_board[0] && cur_board[0] != '-' && \
+            stm32_prog_cache_count < STM32_PROG_CACHE_SZ) {         \
+            stm32_prog_entry_t *e =                                  \
+                &stm32_prog_cache[stm32_prog_cache_count++];         \
+            strlcpy_safe(e->serial, cur_serial, sizeof(e->serial)); \
+            strlcpy_safe(e->board, cur_board, sizeof(e->board));    \
+        }                                                            \
+        cur_serial[0] = '\0';                                        \
+        cur_board[0] = '\0';                                         \
+    } while (0)
+
+    while (fgets(line, sizeof(line), fp)) {
+        strip_ansi(line);
+        trim_inplace(line);
+
+        /* Block start: "ST-Link Probe N :" or "ST-LINK Probe N :"
+         * Marks the beginning of a probe entry inside the
+         * "Connected ST-LINK Probes List" section. */
+        if ((strncmp(line, "ST-Link Probe", 13) == 0 ||
+             strncmp(line, "ST-LINK Probe", 13) == 0) &&
+            strchr(line, ':')) {
+            STM32_PROG_FLUSH();
+            in_probe_block = 1;
+            continue;
+        }
+
+        /* End-of-list delimiter: a row of dashes closes the probe
+         * list. The CLI's later sections ("UART Interface", etc.)
+         * use the same Board Name / ST-LINK SN keys but in reversed
+         * order which would corrupt our state machine, so stop
+         * parsing once the probe list ends. */
+        if (line[0] == '-' && strspn(line, "-") >= 5) {
+            STM32_PROG_FLUSH();
+            in_probe_block = 0;
+            continue;
+        }
+
+        if (!in_probe_block)
+            continue;
+
+        const char *colon = strchr(line, ':');
+        if (!colon)
+            continue;
+
+        if (strncmp(line, "ST-LINK SN", 10) == 0 ||
+            strncmp(line, "ST-Link SN", 10) == 0) {
+            const char *v = colon + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            strlcpy_safe(cur_serial, v, sizeof(cur_serial));
+            trim_inplace(cur_serial);
+        } else if (strncmp(line, "Board Name", 10) == 0) {
+            const char *v = colon + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            strlcpy_safe(cur_board, v, sizeof(cur_board));
+            trim_inplace(cur_board);
+        }
+    }
+
+    /* flush trailing block (no end-of-list dashes seen) */
+    STM32_PROG_FLUSH();
+    #undef STM32_PROG_FLUSH
+
+    int rc = pclose(fp);
+    /* CLI exit code is unreliable (returns non-zero when any single
+     * probe fails). Trust whatever entries we parsed. */
+    (void)rc;
+
+    return stm32_prog_cache_count > 0 ? 0 : -1;
+}
+
+/* Look up board name from STM32_Programmer_CLI by S/N. Returns 0 +
+ * fills board_out on success, -1 if not found / CLI not installed. */
+static int
+probe_stm32_programmer(const char *serial, char *board_out, size_t board_sz)
+{
+    if (!serial || !serial[0])
+        return -1;
+    if (stm32_prog_cache_populate() < 0)
+        return -1;
+    for (int i = 0; i < stm32_prog_cache_count; i++) {
+        if (strcmp(stm32_prog_cache[i].serial, serial) == 0) {
+            strlcpy_safe(board_out, stm32_prog_cache[i].board, board_sz);
+            return 0;
+        }
     }
     return -1;
 }
@@ -311,15 +565,20 @@ identify_port(const char *dev_path, tty_port_t *port)
     /* try to match board by USB product string */
     port->board_match = lookup_board_by_product(port->product);
 
-    /* For ambiguous devices (VID:PID shared by multiple MCU families
-     * like the STLINK-V3), probe the debug interface to resolve the
-     * actual chip. Only runs if the user hasn't already matched by
-     * product string. Best-effort: silently falls through if st-info
-     * is missing or the probe fails. */
+    /* For ambiguous devices (VID:PID shared by multiple boards / MCU
+     * families like the STLINK-V3), probe to resolve the actual board.
+     * Try STM32_Programmer_CLI first -- it returns the full NUCLEO
+     * board name and works even when the target is in reset / sleep.
+     * Fall back to st-info DBGMCU IDCODE probing if the CLI is not
+     * installed. Best-effort: silently falls through on any failure. */
     if (port->known && !port->board_match && port->serial[0] &&
         known_device_is_ambiguous(port->known)) {
-        char probed[48];
-        if (probe_stlink_chipid(port->serial, probed, sizeof(probed)) == 0)
+        char probed[64];
+        if (probe_stm32_programmer(port->serial, probed,
+                                   sizeof(probed)) == 0)
+            port->board_match = intern_board_name(probed);
+        else if (probe_stlink_chipid(port->serial, probed,
+                                     sizeof(probed)) == 0)
             port->board_match = intern_board_name(probed);
     }
 
@@ -367,6 +626,37 @@ scan_all_ports(tty_port_t *ports, int max_ports)
     return n;
 }
 
+/* Normalize a board name into a filesystem-safe label fragment:
+ * spaces and '-' become '_', lowercase letters become uppercase,
+ * other ASCII non-alnum becomes '_'. */
+static void
+sanitize_label(char *s)
+{
+    for (char *p = s; *p; p++) {
+        if (*p >= 'a' && *p <= 'z') {
+            *p -= 32;
+            continue;
+        }
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9'))
+            continue;
+        *p = '_';
+    }
+}
+
+/* Append "_<last 8 chars of serial>" to dst (no-op if no serial).
+ * Used to disambiguate labels when probe failed and multiple
+ * unresolved devices share the same known_device name. */
+static void
+append_sn_suffix(char *suffix, size_t sz, const char *serial)
+{
+    suffix[0] = '\0';
+    if (!serial || !serial[0])
+        return;
+    size_t slen = strlen(serial);
+    const char *tail = serial + (slen > 8 ? slen - 8 : 0);
+    snprintf(suffix, sz, "_%s", tail);
+}
+
 void
 get_device_label(tty_port_t *port)
 {
@@ -374,23 +664,18 @@ get_device_label(tty_port_t *port)
     if (port->board_override && port->board_override[0]) {
         char board[48];
         strlcpy_safe(board, port->board_override, sizeof(board));
-        for (char *p = board; *p; p++) {
-            if (*p == ' ') *p = '_';
-            if (*p >= 'a' && *p <= 'z') *p -= 32;
-        }
+        sanitize_label(board);
         snprintf(port->label, sizeof(port->label),
                  "%.48s_UART%d", board, port->interface_num);
         return;
     }
 
-    /* If board matched by USB product string */
+    /* If board matched by USB product string or by active probe
+     * (STM32_Programmer_CLI / st-info chipid) */
     if (port->board_match) {
         char clean[48];
         strlcpy_safe(clean, port->board_match, sizeof(clean));
-        for (char *p = clean; *p; p++) {
-            if (*p == ' ') *p = '_';
-            if (*p >= 'a' && *p <= 'z') *p -= 32;
-        }
+        sanitize_label(clean);
         if (port->known && port->known->expected_ports > 1) {
             snprintf(port->label, sizeof(port->label),
                      "%.48s_UART%d", clean, port->interface_num);
@@ -401,18 +686,18 @@ get_device_label(tty_port_t *port)
         return;
     }
 
-    /* Ambiguous device (multiple candidate boards share this VID:PID):
-     * if we weren't able to resolve it via product-string / probe, use
-     * the device name instead of arbitrarily picking boards[0]. E.g.
-     * STLINK-V3 with unknown chipid -> STM32_STLINK_V3_UART. */
+    /* Ambiguous device with no resolved board: probe failed (target in
+     * reset, no SWD, CLI not installed, etc.).  Use the known_device
+     * name plus an S/N suffix so multiple unresolved boards don't
+     * collide.  E.g. STM32_VIRTUAL_COM_PORT_UART_38363431. */
     if (known_device_is_ambiguous(port->known)) {
         char clean[48];
+        char sn_suffix[10];
         strlcpy_safe(clean, port->known->name, sizeof(clean));
-        for (char *p = clean; *p; p++) {
-            if (*p == ' ' || *p == '-') *p = '_';
-            if (*p >= 'a' && *p <= 'z') *p -= 32;
-        }
-        snprintf(port->label, sizeof(port->label), "%.48s_UART", clean);
+        sanitize_label(clean);
+        append_sn_suffix(sn_suffix, sizeof(sn_suffix), port->serial);
+        snprintf(port->label, sizeof(port->label),
+                 "%.40s_UART%s", clean, sn_suffix);
         return;
     }
 
@@ -421,10 +706,7 @@ get_device_label(tty_port_t *port)
         const char *board = port->known->boards[0];
         char clean[48];
         strlcpy_safe(clean, board, sizeof(clean));
-        for (char *p = clean; *p; p++) {
-            if (*p == ' ') *p = '_';
-            if (*p >= 'a' && *p <= 'z') *p -= 32;
-        }
+        sanitize_label(clean);
         if (strcmp(clean, "GENERIC") == 0) {
             /* Generic devices: include tty name to avoid collisions
              * when multiple unidentified adapters are present */

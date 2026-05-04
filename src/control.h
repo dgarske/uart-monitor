@@ -22,7 +22,11 @@
 #define CONTROL_H
 
 #define CONTROL_SOCK_PATH LOG_BASE_DIR "/uart-monitor.sock"
-#define CONTROL_MAX_MSG   4096
+/* STATUS responses include all monitored ports; with ~150 bytes per
+ * port and MAX_PORTS=64 this fits comfortably under 16 KB.  Bumped
+ * to 64 KB to leave headroom; both server (resp[]) and client (buf[])
+ * are stack-allocated at this size, fine on a default 8 MB stack. */
+#define CONTROL_MAX_MSG   65536
 
 /* Initialize the control socket server.
  * Returns listening fd, or -1 on error. */

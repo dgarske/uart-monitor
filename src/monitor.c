@@ -749,9 +749,22 @@ handle_control_cmd(monitor_state_t *state, int client_fd)
                  "ERROR unknown command: %s\n", buf);
     }
 
-    /* send response (best effort) and close */
-    ssize_t written = write(client_fd, resp, strlen(resp));
-    (void)written;
+    /* send response (best effort) and close. Loop because writes on
+     * Unix sockets can short-return for payloads larger than the
+     * kernel buffer (we allow up to 64 KB now). */
+    size_t resp_len = strlen(resp);
+    size_t sent = 0;
+    while (sent < resp_len) {
+        ssize_t nw = write(client_fd, resp + sent, resp_len - sent);
+        if (nw < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (nw == 0)
+            break;
+        sent += (size_t)nw;
+    }
     close(client_fd);
 }
 
