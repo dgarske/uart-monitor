@@ -6,6 +6,7 @@ After=local-fs.target
 Type=notify
 ExecStart=%h/.local/bin/uart-monitor monitor --systemd --proxy
 ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=/bin/sh -c 'logger -t uart-monitor-stop "result=$SERVICE_RESULT code=$EXIT_CODE status=$EXIT_STATUS"; ps -eo pid,ppid,user,cmd 2>/dev/null | grep -E "systemctl.*uart-monitor" | grep -v grep | logger -t uart-monitor-stop; true'
 Restart=on-failure
 RestartSec=3
 StartLimitIntervalSec=60

@@ -877,6 +877,10 @@ cmd_monitor(int argc, char *argv[])
 
     int foreground = 0;
 
+    /* Ignore SIGPIPE: a closed PTY slave or disconnected control socket
+     * must not kill the daemon. write() returns -1/EPIPE instead. */
+    signal(SIGPIPE, SIG_IGN);
+
     /* parse options */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-f") == 0 ||
@@ -1036,8 +1040,12 @@ cmd_monitor(int argc, char *argv[])
         if (nfds < 0) {
             if (errno == EINTR)
                 continue;
-            fprintf(stderr, "monitor: epoll_wait: %s\n", strerror(errno));
-            break;
+            /* Transient epoll errors must not kill the daemon. Log and
+             * retry after a short back-off to avoid a tight error loop. */
+            fprintf(stderr, "monitor: epoll_wait: %s (continuing)\n",
+                    strerror(errno));
+            usleep(100000); /* 100ms */
+            continue;
         }
 
         for (int i = 0; i < nfds; i++) {
@@ -1081,11 +1089,20 @@ cmd_monitor(int argc, char *argv[])
                     mp->bytes_read += (size_t)nr;
 
                     /* proxy mode: forward serial data to PTY master
-                     * so anyone reading the PTY slave sees the output */
+                     * so anyone reading the PTY slave sees the output.
+                     * EPIPE/EAGAIN/EIO are expected (no reader / buffer
+                     * full / slave closed) and are silently dropped --
+                     * SIGPIPE is ignored so the daemon stays alive. */
                     if (mp->serial.pty_master >= 0) {
                         ssize_t nw = write(mp->serial.pty_master,
                                            read_buf, (size_t)nr);
-                        (void)nw; /* best effort */
+                        if (nw < 0 && errno != EPIPE &&
+                            errno != EAGAIN && errno != EWOULDBLOCK &&
+                            errno != EIO) {
+                            fprintf(stderr,
+                                "monitor: PTY write %s: %s\n",
+                                mp->identity.dev_path, strerror(errno));
+                        }
                     }
                 } else if (nr == 0 ||
                            (nr < 0 && errno != EAGAIN &&
@@ -1116,10 +1133,17 @@ cmd_monitor(int argc, char *argv[])
                                   sizeof(read_buf));
 
                 if (nr > 0) {
-                    /* forward to real serial port */
+                    /* forward to real serial port. EPIPE / EIO / EAGAIN
+                     * are silently dropped; other errors get logged. */
                     ssize_t nw = write(mp->serial.fd,
                                        read_buf, (size_t)nr);
-                    (void)nw; /* best effort */
+                    if (nw < 0 && errno != EPIPE &&
+                        errno != EAGAIN && errno != EWOULDBLOCK &&
+                        errno != EIO) {
+                        fprintf(stderr,
+                            "monitor: serial write %s: %s\n",
+                            mp->identity.dev_path, strerror(errno));
+                    }
                 } else if (nr == 0 ||
                            (nr < 0 && errno != EAGAIN &&
                             errno != EWOULDBLOCK && errno != EIO)) {
