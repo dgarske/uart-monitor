@@ -209,9 +209,11 @@ typedef struct {
 } stm32_prog_entry_t;
 
 #define STM32_PROG_CACHE_SZ 16
+#define STM32_PROG_CACHE_TTL_SEC 2
 static stm32_prog_entry_t stm32_prog_cache[STM32_PROG_CACHE_SZ];
 static int stm32_prog_cache_count = 0;
 static int stm32_prog_cache_populated = 0;
+static time_t stm32_prog_cache_time = 0;
 
 /* Path to STM32_Programmer_CLI, found once per process and cached.
  * Empty string = not installed (negative cache). */
@@ -223,6 +225,7 @@ stm32_prog_cache_reset(void)
 {
     stm32_prog_cache_count = 0;
     stm32_prog_cache_populated = 0;
+    stm32_prog_cache_time = 0;
     /* don't reset the path cache -- the binary location doesn't move */
 }
 
@@ -332,9 +335,12 @@ trim_inplace(char *s)
 static int
 stm32_prog_cache_populate(void)
 {
-    if (stm32_prog_cache_populated)
+    time_t now = time(NULL);
+    if (stm32_prog_cache_populated &&
+        now - stm32_prog_cache_time < STM32_PROG_CACHE_TTL_SEC)
         return stm32_prog_cache_count > 0 ? 0 : -1;
     stm32_prog_cache_populated = 1;
+    stm32_prog_cache_time = now;
     stm32_prog_cache_count = 0;
 
     const char *cli = find_stm32_programmer_cli();
