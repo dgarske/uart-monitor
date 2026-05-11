@@ -91,6 +91,13 @@ stlink_probe_cache_reset(void)
     stm32_prog_cache_reset();
 }
 
+/* Public wrapper used by the daemon's hot-plug handler. */
+void
+identify_reset_probe_caches(void)
+{
+    stlink_probe_cache_reset();
+}
+
 /* Populate the cache by running `st-info --probe` once. Returns 0 on
  * success (including the case of zero programmers found), -1 if the
  * subprocess failed (tool missing, exec error, non-zero exit). */

@@ -68,6 +68,12 @@ int scan_all_ports(tty_port_t *ports, int max_ports);
 /* Identify a single port by reading sysfs. Returns 0 on success. */
 int identify_port(const char *dev_path, tty_port_t *port);
 
+/* Drop cached results from st-info / STM32_Programmer_CLI probes so the
+ * next identify_port() call shells out fresh. Use this after a hot-plug
+ * event where the cache may have been populated before the new device
+ * fully enumerated on the USB bus. */
+void identify_reset_probe_caches(void);
+
 /* Group ports by parent USB device. Returns number of groups. */
 int group_ports(tty_port_t *ports, int nports,
                 device_group_t *groups, int max_groups);

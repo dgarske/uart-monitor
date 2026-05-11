@@ -825,11 +825,32 @@ handle_hotplug(monitor_state_t *state)
     if (hev.action == HOTPLUG_ADD) {
         printf("  Hot-plug: %s added\n", hev.devpath);
 
-        /* wait for device to settle */
-        usleep(200000);
+        /* Wait for the device to settle. Older ST-LINK V2-1 firmware
+         * (e.g. NUCLEO-L552ZE-Q with V2J38M27) can take longer than
+         * 200ms before STM32_Programmer_CLI sees the new probe on the
+         * USB bus, so give it a generous window. */
+        usleep(800000);
+
+        /* Drop any cached st-info / STM32_Programmer_CLI results. A
+         * recent hot-plug for a different device may have populated
+         * the cache without this one in it; we want a fresh probe. */
+        identify_reset_probe_caches();
 
         tty_port_t port;
-        if (identify_port(hev.devpath, &port) == 0) {
+        int rc = identify_port(hev.devpath, &port);
+
+        /* If we landed on the generic fallback label (ambiguous known
+         * device with no resolved board), the probe likely raced the
+         * USB enumeration. Wait a bit longer and try once more. */
+        if (rc == 0 && port.known &&
+            known_device_is_ambiguous(port.known) &&
+            !port.board_match) {
+            usleep(1500000);
+            identify_reset_probe_caches();
+            rc = identify_port(hev.devpath, &port);
+        }
+
+        if (rc == 0) {
             /* apply board config */
             board_id_t bids[MAX_BOARD_IDS];
             int nbids = load_board_config(bids, MAX_BOARD_IDS);
