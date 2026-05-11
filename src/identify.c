@@ -98,6 +98,63 @@ identify_reset_probe_caches(void)
     stlink_probe_cache_reset();
 }
 
+/* -------------------------------------------------------------------- */
+/* Sticky identity cache, keyed by USB serial number.                   */
+/*                                                                      */
+/* The per-scan probe caches above are wiped on every full rescan /     */
+/* hotplug event so that fresh st-info / STM32_Programmer_CLI results   */
+/* are picked up. That makes us correct, but fragile: if a probe races  */
+/* USB enumeration (12+ STLINKs on the bus, target in reset, etc.) we   */
+/* fall through to the generic STM32_STLINK_V3_UART_<sn> label and stay */
+/* there until daemon restart.                                          */
+/*                                                                      */
+/* Once we have resolved a serial to a real board_match, that mapping   */
+/* is physically immutable for the life of the device on the bus, so    */
+/* we remember it process-wide. A later identify_port() for the same    */
+/* serial whose live probe failed will fall back to the sticky entry    */
+/* instead of the generic label.                                        */
+/* -------------------------------------------------------------------- */
+
+typedef struct {
+    char serial[64];
+    const char *board_match; /* interned in probe_name_arena */
+} sticky_identity_t;
+
+#define STICKY_IDENTITY_SZ 32
+static sticky_identity_t sticky_identity[STICKY_IDENTITY_SZ];
+static int sticky_identity_count = 0;
+
+static const char *
+sticky_identity_lookup(const char *serial)
+{
+    if (!serial || serial[0] == '\0')
+        return NULL;
+    for (int i = 0; i < sticky_identity_count; i++) {
+        if (strcmp(sticky_identity[i].serial, serial) == 0)
+            return sticky_identity[i].board_match;
+    }
+    return NULL;
+}
+
+static void
+sticky_identity_remember(const char *serial, const char *board_match)
+{
+    if (!serial || serial[0] == '\0' || !board_match)
+        return;
+    for (int i = 0; i < sticky_identity_count; i++) {
+        if (strcmp(sticky_identity[i].serial, serial) == 0) {
+            sticky_identity[i].board_match = board_match;
+            return;
+        }
+    }
+    if (sticky_identity_count < STICKY_IDENTITY_SZ) {
+        strlcpy_safe(sticky_identity[sticky_identity_count].serial,
+                     serial, 64);
+        sticky_identity[sticky_identity_count].board_match = board_match;
+        sticky_identity_count++;
+    }
+}
+
 /* Populate the cache by running `st-info --probe` once. Returns 0 on
  * success (including the case of zero programmers found), -1 if the
  * subprocess failed (tool missing, exec error, non-zero exit). */
@@ -593,6 +650,16 @@ identify_port(const char *dev_path, tty_port_t *port)
         else if (probe_stlink_chipid(port->serial, probed,
                                      sizeof(probed)) == 0)
             port->board_match = intern_board_name(probed);
+
+        /* Probe succeeded: remember the (serial -> board) mapping so a
+         * later transient probe failure (e.g. raced hot-plug, target in
+         * reset) can recover without downgrading the label. Probe
+         * failed: consult the sticky cache before falling through to
+         * the generic STM32_STLINK_V3_UART_<sn> fallback. */
+        if (port->board_match)
+            sticky_identity_remember(port->serial, port->board_match);
+        else
+            port->board_match = sticky_identity_lookup(port->serial);
     }
 
     /* determine function name */
