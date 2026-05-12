@@ -50,7 +50,13 @@ typedef struct {
     uint32_t chipid;
 } stlink_probe_entry_t;
 
-#define STLINK_PROBE_CACHE_SZ 8
+/* Sized to comfortably hold every ST-LINK that fits on a typical USB
+ * hub fan-out (4-port hub * 4 levels). The daemon must keep ALL probes
+ * in the cache because a newly hot-plugged device may appear at any
+ * index in `st-info --probe` output; if it gets dropped, identify_port
+ * falls back to the generic "STM32_ST_LINK_UART_<sn>" label and the
+ * sticky cache never learns the real board name. */
+#define STLINK_PROBE_CACHE_SZ 64
 #define STLINK_PROBE_CACHE_TTL_SEC 2
 static stlink_probe_entry_t stlink_probe_cache[STLINK_PROBE_CACHE_SZ];
 static int stlink_probe_cache_count = 0;
@@ -59,8 +65,9 @@ static time_t stlink_probe_cache_time = 0;
 
 /* Arena for probe-derived board names. The tty_port_t->board_match field
  * is `const char *` and expects pointers that live for the process, so
- * we can't hand out stack buffers. Sized for ~16 NUCLEO-* names. */
-#define PROBE_NAME_ARENA_SZ 1024
+ * we can't hand out stack buffers. Sized to comfortably hold a unique
+ * NUCLEO-* name for every entry in the per-scan probe caches. */
+#define PROBE_NAME_ARENA_SZ 4096
 static char probe_name_arena[PROBE_NAME_ARENA_SZ];
 static size_t probe_name_arena_used = 0;
 
@@ -120,7 +127,7 @@ typedef struct {
     const char *board_match; /* interned in probe_name_arena */
 } sticky_identity_t;
 
-#define STICKY_IDENTITY_SZ 32
+#define STICKY_IDENTITY_SZ 64
 static sticky_identity_t sticky_identity[STICKY_IDENTITY_SZ];
 static int sticky_identity_count = 0;
 
@@ -272,7 +279,9 @@ typedef struct {
     char board[64];
 } stm32_prog_entry_t;
 
-#define STM32_PROG_CACHE_SZ 16
+/* Match STLINK_PROBE_CACHE_SZ so the CubeProgrammer path never silently
+ * drops a probe before st-info gets a chance. */
+#define STM32_PROG_CACHE_SZ 64
 #define STM32_PROG_CACHE_TTL_SEC 2
 static stm32_prog_entry_t stm32_prog_cache[STM32_PROG_CACHE_SZ];
 static int stm32_prog_cache_count = 0;
