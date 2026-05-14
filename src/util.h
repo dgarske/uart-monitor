@@ -50,4 +50,12 @@ int mkdirp(const char *path);
 /* Atomically update a symlink (create tmp, rename). Returns 0 on success. */
 int symlink_update(const char *target, const char *linkpath);
 
+/* Look up a port in the running daemon's status.json by device path
+ * (e.g. "/dev/ttyACM16" or "ttyACM16") or label (e.g. "NUCLEO_F767ZI_UART").
+ * Either output buffer may be NULL if the caller doesn't need it.
+ * Returns 0 on match, -1 if no match or status.json is unavailable. */
+int status_lookup(const char *device_or_label,
+                  char *label_out, size_t label_sz,
+                  char *log_out, size_t log_sz);
+
 #endif /* UTIL_H */

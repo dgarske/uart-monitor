@@ -208,7 +208,8 @@ cmd_tail(int argc, char *argv[])
         return 1;
     }
 
-    const char *name = argv[1];
+    const char *arg = argv[1];
+    const char *name = arg;
 
     /* strip /dev/ prefix if present */
     if (strncmp(name, "/dev/", 5) == 0)
@@ -220,17 +221,23 @@ cmd_tail(int argc, char *argv[])
              "%s/latest/%s.log", LOG_BASE_DIR, name);
 
     if (access(logpath, R_OK) != 0) {
-        /* not found -- try scanning for a label match */
-        fprintf(stderr, "Log file not found: %s\n", logpath);
-        fprintf(stderr, "Available logs in %s/latest/:\n", LOG_BASE_DIR);
+        /* fall back to the running daemon's status.json -- resolves
+         * stale labels (daemon started before the latest identify
+         * logic) and device-path inputs like "/dev/ttyACM16". */
+        if (status_lookup(arg, NULL, 0, logpath, sizeof(logpath)) != 0 ||
+            access(logpath, R_OK) != 0) {
+            fprintf(stderr, "Log file not found: %s/latest/%s.log\n",
+                    LOG_BASE_DIR, name);
+            fprintf(stderr, "Available logs in %s/latest/:\n", LOG_BASE_DIR);
 
-        /* list available log files */
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd),
-                 "ls -1 %s/latest/*.log 2>/dev/null", LOG_BASE_DIR);
-        int ret = system(cmd);
-        (void)ret;
-        return 1;
+            /* list available log files */
+            char cmd[512];
+            snprintf(cmd, sizeof(cmd),
+                     "ls -1 %s/latest/*.log 2>/dev/null", LOG_BASE_DIR);
+            int ret = system(cmd);
+            (void)ret;
+            return 1;
+        }
     }
 
     /* exec directly into tail so the running process is just tail

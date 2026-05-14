@@ -144,3 +144,110 @@ symlink_update(const char *target, const char *linkpath)
     }
     return 0;
 }
+
+/* Extract the quoted string value of `key` inside [from, stop).
+ * On success writes into out and returns a pointer past the closing
+ * quote. Returns NULL if key not present within the bounds. */
+static const char *
+json_get_str(const char *from, const char *stop, const char *key,
+             char *out, size_t outsz)
+{
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+
+    const char *p = strstr(from, needle);
+    if (p == NULL || p >= stop)
+        return NULL;
+
+    p = strchr(p + strlen(needle), '"');
+    if (p == NULL || p >= stop)
+        return NULL;
+
+    const char *end = strchr(p + 1, '"');
+    if (end == NULL || end >= stop)
+        return NULL;
+
+    size_t n = (size_t)(end - p - 1);
+    if (outsz > 0) {
+        if (n >= outsz)
+            n = outsz - 1;
+        memcpy(out, p + 1, n);
+        out[n] = '\0';
+    }
+    return end + 1;
+}
+
+int
+status_lookup(const char *device_or_label,
+              char *label_out, size_t label_sz,
+              char *log_out, size_t log_sz)
+{
+    if (device_or_label == NULL)
+        return -1;
+
+    FILE *fp = fopen("/tmp/uart-monitor/status.json", "r");
+    if (fp == NULL)
+        return -1;
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    long sz = ftell(fp);
+    if (sz <= 0 || sz > (long)(1024 * 1024)) {
+        fclose(fp);
+        return -1;
+    }
+    rewind(fp);
+
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (buf == NULL) {
+        fclose(fp);
+        return -1;
+    }
+    size_t nr = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[nr] = '\0';
+
+    /* normalise input to a /dev/ path for the device-match comparison */
+    char dev_path[256];
+    if (strncmp(device_or_label, "/dev/", 5) == 0)
+        strlcpy_safe(dev_path, device_or_label, sizeof(dev_path));
+    else
+        snprintf(dev_path, sizeof(dev_path), "/dev/%s", device_or_label);
+
+    int found = 0;
+    const char *p = buf;
+    while ((p = strstr(p, "\"device\":")) != NULL) {
+        /* a port block ends with "    }" at column 4 in write_status_json */
+        const char *block_end = strstr(p, "    }");
+        if (block_end == NULL)
+            block_end = buf + nr;
+
+        char device[256];
+        char label[256];
+        char logfile[512];
+        device[0] = '\0';
+        label[0] = '\0';
+        logfile[0] = '\0';
+
+        json_get_str(p, block_end, "device", device, sizeof(device));
+        json_get_str(p, block_end, "label", label, sizeof(label));
+        json_get_str(p, block_end, "log_file", logfile, sizeof(logfile));
+
+        if (strcmp(device, dev_path) == 0 ||
+            (label[0] != '\0' && strcmp(label, device_or_label) == 0)) {
+            if (label_out != NULL)
+                strlcpy_safe(label_out, label, label_sz);
+            if (log_out != NULL)
+                strlcpy_safe(log_out, logfile, log_sz);
+            found = 1;
+            break;
+        }
+
+        p = block_end;
+    }
+
+    free(buf);
+    return found ? 0 : -1;
+}

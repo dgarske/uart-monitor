@@ -1111,12 +1111,35 @@ print_port_table(device_group_t *groups, int ngroups, int verbose)
                 tty_port_t *port = grp->ports[p];
                 printf("    %s -> %s\n", port->dev_path, port->label);
 
-                /* show log file path if it exists */
-                char logpath[512];
-                snprintf(logpath, sizeof(logpath),
-                         LOG_BASE_DIR "/latest/%s.log", port->label);
-                if (access(logpath, F_OK) == 0)
-                    printf("      Log: %s\n", logpath);
+                /* prefer the running daemon's view -- its label may differ
+                 * from the freshly-predicted one if the daemon was started
+                 * before the latest identify logic, and its log_file is
+                 * the file `tail` actually needs. */
+                char d_label[256];
+                char d_log[512];
+                d_label[0] = '\0';
+                d_log[0] = '\0';
+                int monitored = status_lookup(port->dev_path,
+                                              d_label, sizeof(d_label),
+                                              d_log, sizeof(d_log));
+
+                if (monitored == 0 && d_label[0] != '\0' &&
+                    strcmp(d_label, port->label) != 0) {
+                    printf("      Monitored as: %s (daemon restart picks up"
+                           " new label)\n", d_label);
+                }
+
+                if (monitored == 0 && d_log[0] != '\0') {
+                    printf("      Log: %s\n", d_log);
+                } else {
+                    /* daemon isn't monitoring this port -- fall back to
+                     * the predicted-label path if it happens to exist */
+                    char logpath[512];
+                    snprintf(logpath, sizeof(logpath),
+                             LOG_BASE_DIR "/latest/%s.log", port->label);
+                    if (access(logpath, F_OK) == 0)
+                        printf("      Log: %s\n", logpath);
+                }
 
                 /* show PTY proxy path if it exists */
                 char ptypath[512];
