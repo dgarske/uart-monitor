@@ -242,8 +242,22 @@ cmd_tail(int argc, char *argv[])
 
     /* exec directly into tail so the running process is just tail
      * (no waiting parent, no /bin/sh in between, signals and exit
-     * code propagate cleanly). */
-    char *tail_argv[] = { (char *)"tail", (char *)"-f", logpath, NULL };
+     * code propagate cleanly).
+     *
+     * "-F" (--follow=name --retry) follows by name so tail survives the
+     * "latest" session symlink being repointed on a new session; plain
+     * "-f" would cling to a stale fd after rotation.
+     *
+     * "---disable-inotify" (GNU coreutils, Linux-only -- this daemon is
+     * Linux-only) forces tail to poll instead of using inotify. Serial
+     * logs are low volume so the 1s poll latency is fine, and it avoids
+     * the per-user inotify-instance limit: without it, once that limit
+     * is exhausted (VS Code, browsers, etc.) tail prints
+     * "inotify cannot be used, reverting to polling: Too many open
+     * files" to stderr. Polling sidesteps the warning entirely and
+     * consumes zero inotify instances. */
+    char *tail_argv[] = { (char *)"tail", (char *)"-F",
+                          (char *)"---disable-inotify", logpath, NULL };
     execvp("tail", tail_argv);
     /* execvp returns only on failure */
     fprintf(stderr, "execvp tail: %s\n", strerror(errno));

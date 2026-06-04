@@ -124,6 +124,7 @@ identify_reset_probe_caches(void)
 
 typedef struct {
     char serial[64];
+    char usb_path[128];      /* USB topology path, e.g. "1-6.2" */
     const char *board_match; /* interned in probe_name_arena */
 } sticky_identity_t;
 
@@ -131,32 +132,52 @@ typedef struct {
 static sticky_identity_t sticky_identity[STICKY_IDENTITY_SZ];
 static int sticky_identity_count = 0;
 
+/* Look up a remembered board name. Try the USB serial first (authoritative
+ * and stable), then fall back to the USB topology path so a device that
+ * re-enumerates with a different sysfs serial -- but stays in the same
+ * physical hub port -- still recovers its real board name. */
 static const char *
-sticky_identity_lookup(const char *serial)
+sticky_identity_lookup(const char *serial, const char *usb_path)
 {
-    if (!serial || serial[0] == '\0')
-        return NULL;
-    for (int i = 0; i < sticky_identity_count; i++) {
-        if (strcmp(sticky_identity[i].serial, serial) == 0)
-            return sticky_identity[i].board_match;
+    int i;
+    if (serial && serial[0] != '\0') {
+        for (i = 0; i < sticky_identity_count; i++) {
+            if (strcmp(sticky_identity[i].serial, serial) == 0)
+                return sticky_identity[i].board_match;
+        }
+    }
+    if (usb_path && usb_path[0] != '\0') {
+        for (i = 0; i < sticky_identity_count; i++) {
+            if (sticky_identity[i].usb_path[0] != '\0' &&
+                strcmp(sticky_identity[i].usb_path, usb_path) == 0)
+                return sticky_identity[i].board_match;
+        }
     }
     return NULL;
 }
 
 static void
-sticky_identity_remember(const char *serial, const char *board_match)
+sticky_identity_remember(const char *serial, const char *usb_path,
+                         const char *board_match)
 {
+    int i;
     if (!serial || serial[0] == '\0' || !board_match)
         return;
-    for (int i = 0; i < sticky_identity_count; i++) {
+    for (i = 0; i < sticky_identity_count; i++) {
         if (strcmp(sticky_identity[i].serial, serial) == 0) {
             sticky_identity[i].board_match = board_match;
+            if (usb_path)
+                strlcpy_safe(sticky_identity[i].usb_path, usb_path,
+                             sizeof(sticky_identity[i].usb_path));
             return;
         }
     }
     if (sticky_identity_count < STICKY_IDENTITY_SZ) {
         strlcpy_safe(sticky_identity[sticky_identity_count].serial,
-                     serial, 64);
+                     serial, sizeof(sticky_identity[0].serial));
+        if (usb_path)
+            strlcpy_safe(sticky_identity[sticky_identity_count].usb_path,
+                         usb_path, sizeof(sticky_identity[0].usb_path));
         sticky_identity[sticky_identity_count].board_match = board_match;
         sticky_identity_count++;
     }
@@ -666,9 +687,11 @@ identify_port(const char *dev_path, tty_port_t *port)
          * failed: consult the sticky cache before falling through to
          * the generic STM32_STLINK_V3_UART_<sn> fallback. */
         if (port->board_match)
-            sticky_identity_remember(port->serial, port->board_match);
+            sticky_identity_remember(port->serial, port->usb_path,
+                                     port->board_match);
         else
-            port->board_match = sticky_identity_lookup(port->serial);
+            port->board_match = sticky_identity_lookup(port->serial,
+                                                       port->usb_path);
     }
 
     /* determine function name */
@@ -749,13 +772,24 @@ append_sn_suffix(char *suffix, size_t sz, const char *serial)
 void
 get_device_label(tty_port_t *port)
 {
-    /* If we have a board override and known device, use board + UART + iface */
+    /* If we have a board override and known device, use board + UART + iface.
+     * Mirror the board_match path below: only single-UART devices (or
+     * unknown ones) get a bare "_UART" -- multi-port devices keep the
+     * interface number. Without this a ~/.boards serial pin for a
+     * single-UART board (e.g. NUCLEO-H563ZI) would produce
+     * "NUCLEO_H563ZI_UART0", not the "NUCLEO_H563ZI_UART" the probe path
+     * produces, breaking label continuity across a probe failure. */
     if (port->board_override && port->board_override[0]) {
         char board[48];
         strlcpy_safe(board, port->board_override, sizeof(board));
         sanitize_label(board);
-        snprintf(port->label, sizeof(port->label),
-                 "%.48s_UART%d", board, port->interface_num);
+        if (port->known && port->known->expected_ports > 1) {
+            snprintf(port->label, sizeof(port->label),
+                     "%.48s_UART%d", board, port->interface_num);
+        } else {
+            snprintf(port->label, sizeof(port->label),
+                     "%.48s_UART", board);
+        }
         return;
     }
 

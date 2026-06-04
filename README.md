@@ -344,6 +344,48 @@ virtual serial ports. This eliminates the byte-splitting problem:
 | Flash tool via PTY path | Yes | Uses PTY instead of real device |
 | Direct access to real device | **No** | Blocked by TIOCEXCL |
 
+## Troubleshooting
+
+### `tail: inotify cannot be used, reverting to polling: Too many open files`
+
+This warning is **harmless** -- `tail` keeps following the log, just by polling once per second instead of via inotify. It appears when the per-user inotify *instance* limit is exhausted (commonly by VS Code, browsers, file watchers, and leftover `tail` processes), not when you are out of real file descriptors. The built-in `uart-monitor tail` already passes `-F ---disable-inotify`, so it polls directly and never prints this; you only see it from a bare `tail -f`.
+
+Check current usage against the limit:
+
+```bash
+# Count inotify instances in use by your user vs. the cap
+for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null; done | grep -c anon_inode:inotify
+cat /proc/sys/fs/inotify/max_user_instances
+```
+
+Raise the limit permanently (one-time, survives reboot):
+
+```bash
+echo 'fs.inotify.max_user_instances=512' | sudo tee /etc/sysctl.d/90-inotify.conf
+sudo sysctl --system
+```
+
+### Stale `tail` processes
+
+Old terminal/agent sessions can leave orphaned followers behind. Clean them up:
+
+```bash
+pkill -f 'tail .*-[fF].*/tmp/uart-monitor'
+```
+
+### A board shows up under a generic label (e.g. `STM32_VIRTUAL_COM_PORT_UART_<sn>`)
+
+ST-LINK boards get their friendly name (e.g. `NUCLEO-H563ZI`) from `STM32_Programmer_CLI`, which reads the board name from the ST-LINK EEPROM. If that tool is **not installed / not on the daemon's PATH** (`~/.local/bin:/usr/local/bin:/usr/bin:/bin`), identification falls back to `st-info` (chip-family name only) and, if a device hot-plugs while a probe fails, to the generic `<known-name>_UART_<serial-suffix>` label. Installing `STM32_Programmer_CLI` is the root fix.
+
+For a deterministic, probe-independent override, pin the board by USB serial in `~/.boards`. Find the serial with `udevadm info -q property -n /dev/ttyACMx | grep ID_SERIAL_SHORT`, then add a section:
+
+```
+# === NUCLEO-H563ZI ===
+# USB: 1-1.2.1 | S/N: 000D001E4D4B500C20373831
+```
+
+Serial matches are authoritative (they bypass the VID:PID compatibility check), apply on every hot-plug, and survive a daemon restart. Apply with `systemctl --user restart uart-monitor`.
+
 ## Future TODO
 
 - [ ] **Auto-yield via fuser**: Poll `fuser /dev/ttyUSBx` every few seconds to
