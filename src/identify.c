@@ -713,6 +713,51 @@ identify_port(const char *dev_path, tty_port_t *port)
 }
 
 int
+read_port_serial(const char *dev_path, char *out, size_t out_sz)
+{
+    const char *slash;
+    char tty_name[32];
+    char syslink[512];
+    char resolved[PATH_MAX];
+    char path[PATH_MAX];
+    char attr[PATH_MAX + 32];
+    char val[128];
+    char *sl;
+    int depth;
+
+    if (out == NULL || out_sz == 0)
+        return -1;
+    out[0] = '\0';
+
+    slash = strrchr(dev_path, '/');
+    strlcpy_safe(tty_name, slash != NULL ? slash + 1 : dev_path,
+                 sizeof(tty_name));
+
+    snprintf(syslink, sizeof(syslink),
+             "/sys/class/tty/%s/device", tty_name);
+    if (realpath(syslink, resolved) == NULL)
+        return -1; /* no sysfs entry -- device gone */
+
+    /* Walk up to the USB device directory (the one with idVendor) and
+     * read its serial. This is the cheap prefix of identify_port() with
+     * no SWD / STM32_Programmer_CLI probe, so it is safe to call often. */
+    strlcpy_safe(path, resolved, sizeof(path));
+    for (depth = 0; depth < 12; depth++) {
+        snprintf(attr, sizeof(attr), "%s/idVendor", path);
+        if (sysfs_read_attr(attr, val, sizeof(val)) >= 0) {
+            snprintf(attr, sizeof(attr), "%s/serial", path);
+            sysfs_read_attr(attr, out, out_sz);
+            return 0; /* serial may legitimately be empty */
+        }
+        sl = strrchr(path, '/');
+        if (sl == NULL || sl == path)
+            break;
+        *sl = '\0';
+    }
+    return 0;
+}
+
+int
 scan_all_ports(tty_port_t *ports, int max_ports)
 {
     glob_t g;

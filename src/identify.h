@@ -68,6 +68,12 @@ int scan_all_ports(tty_port_t *ports, int max_ports);
 /* Identify a single port by reading sysfs. Returns 0 on success. */
 int identify_port(const char *dev_path, tty_port_t *port);
 
+/* Cheap sysfs-only read of a port's USB serial number. Runs no SWD /
+ * STM32_Programmer_CLI probe, so it is safe to call frequently. Writes the
+ * serial (possibly an empty string) to out. Returns 0 on success, or -1 if
+ * the tty has no sysfs device entry (i.e. the device has gone away). */
+int read_port_serial(const char *dev_path, char *out, size_t out_sz);
+
 /* Drop cached results from st-info / STM32_Programmer_CLI probes so the
  * next identify_port() call shells out fresh. Use this after a hot-plug
  * event where the cache may have been populated before the new device

@@ -33,6 +33,7 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -41,6 +42,12 @@
 #define READ_BUF_SIZE     4096
 #define PID_FILE          LOG_BASE_DIR "/uart-monitor.pid"
 #define STATUS_FILE       LOG_BASE_DIR "/status.json"
+
+/* How often the daemon re-checks that the hardware behind each monitored
+ * tty node still matches the label it was opened under. Catches a board
+ * swapped onto a node whose remove/add events the daemon missed (e.g. USB
+ * renumbering), without requiring a daemon restart. */
+#define RECONCILE_INTERVAL_SEC 30
 
 /* ------------------------------------------------------------------ */
 /*  sd_notify -- no libsystemd dependency                             */
@@ -811,6 +818,87 @@ handle_signal(monitor_state_t *state)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Re-identify / relabel                                              */
+/* ------------------------------------------------------------------ */
+
+/* Returns 1 if the freshly probed identity represents a different device
+ * (or a different resolved board) than the one currently stored. The USB
+ * serial is authoritative per physical ST-LINK / probe; fall back to the
+ * resolved label only when neither identity exposes a serial. */
+static int
+identity_changed(const tty_port_t *cur, const tty_port_t *fresh)
+{
+    if (cur->serial[0] != '\0' || fresh->serial[0] != '\0')
+        return strcmp(cur->serial, fresh->serial) != 0;
+    return strcmp(cur->label, fresh->label) != 0;
+}
+
+/* Drop the stale entry at idx and re-add under the fresh identity so the
+ * log is reopened with the correct label. remove_port() writes a
+ * "PORT DISCONNECTED" marker and closes the old log; add_port() opens a
+ * new log / PTY under fresh->label. */
+static void
+relabel_port(monitor_state_t *state, int idx, tty_port_t *fresh)
+{
+    if (idx < 0 || idx >= state->port_count)
+        return;
+    printf("  Relabel: %s [%s] -> [%s]\n",
+           fresh->dev_path, state->ports[idx].identity.label, fresh->label);
+    remove_port(state, idx);
+    add_port(state, fresh);
+}
+
+/* Periodic sweep: for each monitored port, cheaply re-read the sysfs USB
+ * serial behind its tty node. If the node has gone, drop the port. If the
+ * serial changed, the hardware behind the node was swapped -- run a full
+ * re-identify (SWD probe) and relabel. Ports yielded for flashing are left
+ * untouched. */
+static void
+reconcile_ports(monitor_state_t *state)
+{
+    char serial[64];
+    tty_port_t fresh;
+    board_id_t bids[MAX_BOARD_IDS];
+    int i, rc, nbids, changed;
+
+    changed = 0;
+    for (i = 0; i < state->port_count; i++) {
+        monitored_port_t *mp = &state->ports[i];
+
+        if (mp->yielded)
+            continue;
+
+        rc = read_port_serial(mp->identity.dev_path, serial, sizeof(serial));
+        if (rc < 0) {
+            /* node vanished without a remove event -- drop it */
+            printf("  Reconcile: %s gone, removing [%s]\n",
+                   mp->identity.dev_path, mp->identity.label);
+            remove_port(state, i);
+            i--; /* array shifted down */
+            changed = 1;
+            continue;
+        }
+
+        if (strcmp(serial, mp->identity.serial) == 0)
+            continue; /* same physical device -- nothing to do */
+
+        /* hardware behind this node changed -- re-identify and relabel */
+        identify_reset_probe_caches();
+        if (identify_port(mp->identity.dev_path, &fresh) != 0)
+            continue;
+        nbids = load_board_config(bids, MAX_BOARD_IDS);
+        if (nbids > 0)
+            apply_board_config(&fresh, 1, bids, nbids);
+        relabel_port(state, i, &fresh);
+        i--; /* idx i removed; loop re-examines the shifted element */
+        changed = 1;
+    }
+
+    if (changed)
+        write_status_json(state);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Hot-plug handling                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -854,10 +942,22 @@ handle_hotplug(monitor_state_t *state)
             /* apply board config */
             board_id_t bids[MAX_BOARD_IDS];
             int nbids = load_board_config(bids, MAX_BOARD_IDS);
+            int existing;
             if (nbids > 0)
                 apply_board_config(&port, 1, bids, nbids);
 
-            add_port(state, &port);
+            /* If this node was already monitored but the hardware behind
+             * it changed (board swapped onto the same tty node), drop the
+             * stale entry so it reopens under the new label. A port
+             * yielded for flashing is left untouched. Unchanged identities
+             * fall through to add_port(), which dedups by path. */
+            existing = find_port_by_path(state, hev.devpath);
+            if (existing >= 0 && !state->ports[existing].yielded &&
+                identity_changed(&state->ports[existing].identity, &port))
+                relabel_port(state, existing, &port);
+            else
+                add_port(state, &port);
+
             write_status_json(state);
         }
     } else if (hev.action == HOTPLUG_REMOVE) {
@@ -908,6 +1008,7 @@ cmd_monitor(int argc, char *argv[])
     state.signal_fd = -1;
     state.hotplug_fd = -1;
     state.control_fd = -1;
+    state.reconcile_fd = -1;
 
     int foreground = 0;
 
@@ -1020,6 +1121,24 @@ cmd_monitor(int argc, char *argv[])
         epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.hotplug_fd, &ev);
     }
 
+    /* setup periodic reconcile timer */
+    state.reconcile_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    if (state.reconcile_fd >= 0) {
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec = RECONCILE_INTERVAL_SEC;
+        its.it_interval.tv_sec = RECONCILE_INTERVAL_SEC;
+        timerfd_settime(state.reconcile_fd, 0, &its, NULL);
+
+        state.evt_reconcile.type = EVT_RECONCILE;
+        state.evt_reconcile.fd = state.reconcile_fd;
+        struct epoll_event ev = {
+            .events = EPOLLIN,
+            .data.ptr = &state.evt_reconcile
+        };
+        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.reconcile_fd, &ev);
+    }
+
     /* setup control socket */
     state.control_fd = control_init(CONTROL_SOCK_PATH);
     if (state.control_fd >= 0) {
@@ -1095,6 +1214,20 @@ cmd_monitor(int argc, char *argv[])
             case EVT_HOTPLUG:
                 handle_hotplug(&state);
                 break;
+
+            case EVT_RECONCILE: {
+                /* drain the timerfd, then re-check device identities */
+                uint64_t expirations;
+                ssize_t tr = read(state.reconcile_fd, &expirations,
+                                  sizeof(expirations));
+                (void)tr;
+                reconcile_ports(&state);
+                /* reconcile may remove/relabel ports, shifting the array
+                 * and invalidating the rest of this batch's event pointers
+                 * -- stop processing further events this iteration. */
+                i = nfds;
+                break;
+            }
 
             case EVT_CONTROL: {
                 /* accept new control client */
@@ -1207,6 +1340,8 @@ cmd_monitor(int argc, char *argv[])
     if (state.hotplug_fd >= 0)
         hotplug_close(state.hotplug_fd);
     control_close(state.control_fd, CONTROL_SOCK_PATH);
+    if (state.reconcile_fd >= 0)
+        close(state.reconcile_fd);
     if (state.signal_fd >= 0)
         close(state.signal_fd);
     if (state.epoll_fd >= 0)
