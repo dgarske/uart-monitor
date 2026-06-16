@@ -847,7 +847,10 @@ identity_changed(const tty_port_t *cur, const tty_port_t *fresh)
 /* Drop the stale entry at idx and re-add under the fresh identity so the
  * log is reopened with the correct label. remove_port() writes a
  * "PORT DISCONNECTED" marker and closes the old log; add_port() opens a
- * new log / PTY under fresh->label. */
+ * new log / PTY under fresh->label. Use this only when the hardware behind
+ * the node actually changed (board swap): the old serial fd is stale and
+ * must be re-opened. For a same-device label refinement use
+ * relabel_port_inplace(), which never re-opens the USB device. */
 static void
 relabel_port(monitor_state_t *state, int idx, tty_port_t *fresh)
 {
@@ -857,6 +860,86 @@ relabel_port(monitor_state_t *state, int idx, tty_port_t *fresh)
            fresh->dev_path, state->ports[idx].identity.label, fresh->label);
     remove_port(state, idx);
     add_port(state, fresh);
+}
+
+/* Relabel a port in place: the physical device is unchanged (same USB
+ * serial) and only its resolved label improved (e.g. generic ST-LINK
+ * fallback -> NUCLEO board name). Keep the serial and PTY master fds -- and
+ * their epoll registrations, which key off this unchanged slot -- open, so
+ * we never call open() on the USB device again. open()/termios on a wedged
+ * device blocks uninterruptibly in the kernel, so re-opening a perfectly
+ * good fd just to rename a log is both wasteful and risky. Only the log
+ * file and the friendly PTY symlink follow the new label. */
+static void
+relabel_port_inplace(monitor_state_t *state, int idx, tty_port_t *fresh)
+{
+    monitored_port_t *mp;
+    char header[512];
+    char marker[160];
+    const char *board;
+
+    if (idx < 0 || idx >= state->port_count)
+        return;
+    mp = &state->ports[idx];
+
+    printf("  Relabel: %s [%s] -> [%s] (in place)\n",
+           fresh->dev_path, mp->identity.label, fresh->label);
+
+    /* drop the old friendly-name PTY symlink before the label changes */
+    if (mp->serial.pty_master >= 0)
+        pty_remove_symlink(mp->identity.label);
+
+    /* close the old (provisional-label) log; the serial/PTY fds stay open */
+    snprintf(marker, sizeof(marker), "RELABELED to %s", fresh->label);
+    log_marker(&mp->log, marker);
+    log_close(&mp->log);
+
+    /* adopt the new identity. This is metadata only -- the serial fds and
+     * epoll context (mp->serial, mp->evt, mp->evt_pty) live outside the
+     * identity struct and are deliberately left untouched. */
+    mp->identity = *fresh;
+
+    board = "Unknown";
+    if (fresh->board_override)
+        board = fresh->board_override;
+    else if (fresh->known && fresh->known->boards[0])
+        board = fresh->known->boards[0];
+
+    snprintf(header, sizeof(header),
+             "Device: %s (%s)\n"
+             "Board: %s | Interface %d | Function: %s\n"
+             "Baud: %d 8N1\n",
+             fresh->dev_path, fresh->label,
+             board, fresh->interface_num,
+             fresh->function_name ? fresh->function_name : "Unknown",
+             fresh->baud > 0 ? fresh->baud : 115200);
+
+    if (log_open(&mp->log, state->session_path, fresh->label, header) < 0) {
+        /* cannot open the new log -- drop the port cleanly so we do not
+         * leave a slot with a closed log still wired into epoll. */
+        fprintf(stderr, "monitor: relabel %s: log_open failed\n",
+                fresh->dev_path);
+        remove_port(state, idx);
+        return;
+    }
+    mp->log.timestamps = state->timestamps;
+
+    /* compat symlink tty_name.log -> label.log (mirrors add_port) */
+    if (strcmp(fresh->tty_name, fresh->label) != 0) {
+        char link_path[768];
+        char label_log[128];
+        snprintf(link_path, sizeof(link_path),
+                 "%s/%s.log", state->session_path, fresh->tty_name);
+        snprintf(label_log, sizeof(label_log), "%s.log", fresh->label);
+        if (access(link_path, F_OK) != 0) {
+            int sret = symlink(label_log, link_path);
+            (void)sret;
+        }
+    }
+
+    /* recreate the friendly-name PTY symlink pointing at the same slave */
+    if (mp->serial.pty_master >= 0)
+        pty_create_symlink(fresh->label, mp->serial.pty_path);
 }
 
 /* True if a cheaply-identified port still needs the background probe to
@@ -904,7 +987,9 @@ apply_identify_result(monitor_state_t *state, const identify_result_t *r)
     if (strcmp(state->ports[idx].identity.label, fresh.label) == 0)
         return 0; /* probe did not change the label (still generic) */
 
-    relabel_port(state, idx, &fresh);
+    /* same physical device (serial matched above), only the label
+     * improved -- relabel without re-opening the serial fd. */
+    relabel_port_inplace(state, idx, &fresh);
     return 1;
 }
 
