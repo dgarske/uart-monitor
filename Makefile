@@ -19,8 +19,8 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
 
 CC      ?= gcc
-CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -D_GNU_SOURCE -O2
-LDFLAGS =
+CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -D_GNU_SOURCE -O2 -pthread
+LDFLAGS = -pthread
 PREFIX  ?= $(HOME)/.local
 
 SRCDIR  = src

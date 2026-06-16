@@ -22,6 +22,7 @@
 #define MONITOR_H
 
 #include "identify.h"
+#include "identify_worker.h"
 #include "serial.h"
 #include "log.h"
 
@@ -34,6 +35,7 @@ typedef enum {
     EVT_CONTROL,
     EVT_CONTROL_CLIENT,
     EVT_RECONCILE,       /* periodic timerfd: re-check device identities */
+    EVT_IDENTIFY_DONE,   /* worker eventfd: resolved identities pending */
 } event_type_t;
 
 typedef struct {
@@ -60,6 +62,8 @@ typedef struct {
     int              hotplug_fd;
     int              control_fd;
     int              reconcile_fd;    /* timerfd for periodic re-identify */
+    int              identify_fd;     /* worker eventfd (results pending) */
+    identify_worker_t *iw;            /* background identification worker */
     char             session_path[512];
     monitored_port_t ports[MAX_PORTS];
     int              port_count;
@@ -67,6 +71,7 @@ typedef struct {
     event_ctx_t      evt_hotplug;
     event_ctx_t      evt_control;
     event_ctx_t      evt_reconcile;
+    event_ctx_t      evt_identify;
     volatile int     running;
     int              systemd_mode;
     int              proxy_mode;      /* --proxy: PTY proxy for shared access */

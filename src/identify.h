@@ -62,11 +62,26 @@ typedef struct {
 
 #define MAX_BOARD_IDS 32
 
-/* Scan all /dev/ttyUSB*, ttyACM*, ttyUART* ports. Returns count. */
+/* Scan all /dev/ttyUSB*, ttyACM*, ttyUART* ports. Returns count.
+ * Runs the full identify (may shell out to st-info / STM32_Programmer_CLI);
+ * inside the daemon use only off the main thread. */
 int scan_all_ports(tty_port_t *ports, int max_ports);
 
-/* Identify a single port by reading sysfs. Returns 0 on success. */
+/* Like scan_all_ports() but identifies each port with identify_port_cheap()
+ * -- sysfs only, no external probe, no probe-cache reset. Safe on the
+ * daemon's main epoll thread. */
+int scan_all_ports_cheap(tty_port_t *ports, int max_ports);
+
+/* Identify a single port by reading sysfs. Returns 0 on success.
+ * The full path may run an external SWD/CLI probe for ambiguous devices
+ * and mutates probe-cache statics -- in the daemon call this ONLY from
+ * the identify worker thread. */
 int identify_port(const char *dev_path, tty_port_t *port);
+
+/* Cheap identification: sysfs only, no external probe, no probe-cache
+ * access. Safe to call from the daemon's main thread. Ambiguous ST-LINK
+ * devices receive the generic fallback label. Returns 0 on success. */
+int identify_port_cheap(const char *dev_path, tty_port_t *port);
 
 /* Cheap sysfs-only read of a port's USB serial number. Runs no SWD /
  * STM32_Programmer_CLI probe, so it is safe to call frequently. Writes the

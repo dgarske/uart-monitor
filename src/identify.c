@@ -572,8 +572,13 @@ extract_usb_path(const char *sysfs_path, char *usb_path, size_t sz)
     }
 }
 
-int
-identify_port(const char *dev_path, tty_port_t *port)
+/* Core sysfs identification shared by identify_port_cheap() and
+ * identify_port(): fills vid/pid/serial/product/known and the
+ * product-string board match. Runs NO external probe and sets no
+ * label, so it touches none of the probe-cache statics and is safe to
+ * call from the daemon's main thread. */
+static int
+identify_port_core(const char *dev_path, tty_port_t *port)
 {
     memset(port, 0, sizeof(*port));
     strlcpy_safe(port->dev_path, dev_path, sizeof(port->dev_path));
@@ -664,6 +669,53 @@ identify_port(const char *dev_path, tty_port_t *port)
 
     /* try to match board by USB product string */
     port->board_match = lookup_board_by_product(port->product);
+    return 0;
+}
+
+/* Finish identification: assign the function name and the human-readable
+ * label. Shared by identify_port_cheap() and identify_port(). */
+static void
+identify_finish(tty_port_t *port)
+{
+    /* determine function name */
+    if (port->known) {
+        port->function_name =
+            lookup_port_function(port->known->name, port->interface_num);
+    }
+    if (!port->function_name) {
+        if (strstr(port->tty_name, "ACM"))
+            port->function_name = "Main UART";
+        else
+            port->function_name = "Main UART";
+    }
+
+    /* generate label */
+    get_device_label(port);
+}
+
+/* Cheap identification: sysfs only, no external probe. Touches no
+ * probe-cache statics, so it is safe on the daemon's main epoll thread.
+ * Ambiguous ST-LINK devices get the generic fallback label here; the
+ * identify worker resolves the real board name later. */
+int
+identify_port_cheap(const char *dev_path, tty_port_t *port)
+{
+    if (identify_port_core(dev_path, port) != 0)
+        return -1;
+    identify_finish(port);
+    return 0;
+}
+
+/* Full identification: core sysfs read plus, for ambiguous known
+ * devices, an external SWD/CLI probe to resolve the real board name.
+ * The probe shells out (st-info / STM32_Programmer_CLI) and mutates the
+ * probe-cache statics, so inside the daemon this must run ONLY on the
+ * identify worker thread, never the main epoll thread. */
+int
+identify_port(const char *dev_path, tty_port_t *port)
+{
+    if (identify_port_core(dev_path, port) != 0)
+        return -1;
 
     /* For ambiguous devices (VID:PID shared by multiple boards / MCU
      * families like the STLINK-V3), probe to resolve the actual board.
@@ -694,21 +746,7 @@ identify_port(const char *dev_path, tty_port_t *port)
                                                        port->usb_path);
     }
 
-    /* determine function name */
-    if (port->known) {
-        port->function_name =
-            lookup_port_function(port->known->name, port->interface_num);
-    }
-    if (!port->function_name) {
-        if (strstr(port->tty_name, "ACM"))
-            port->function_name = "Main UART";
-        else
-            port->function_name = "Main UART";
-    }
-
-    /* generate label */
-    get_device_label(port);
-
+    identify_finish(port);
     return 0;
 }
 
@@ -776,6 +814,34 @@ scan_all_ports(tty_port_t *ports, int max_ports)
 
     for (size_t i = 0; i < g.gl_pathc && n < max_ports; i++) {
         if (identify_port(g.gl_pathv[i], &ports[n]) == 0)
+            n++;
+    }
+
+    globfree(&g);
+    return n;
+}
+
+/* Same enumeration as scan_all_ports() but uses identify_port_cheap() --
+ * no external probe, no probe-cache reset. Safe to call on the daemon's
+ * main epoll thread (e.g. from write_status_json / SIGHUP rescan) while
+ * the identify worker owns the probe path. Ambiguous ST-LINK ports come
+ * back with their generic fallback labels. */
+int
+scan_all_ports_cheap(tty_port_t *ports, int max_ports)
+{
+    glob_t g;
+    int flags = 0;
+    int n = 0;
+
+    memset(&g, 0, sizeof(g));
+
+    glob("/dev/ttyUSB*",  flags, NULL, &g);
+    flags |= GLOB_APPEND;
+    glob("/dev/ttyACM*",  flags, NULL, &g);
+    glob("/dev/ttyUART*", flags, NULL, &g);
+
+    for (size_t i = 0; i < g.gl_pathc && n < max_ports; i++) {
+        if (identify_port_cheap(g.gl_pathv[i], &ports[n]) == 0)
             n++;
     }
 

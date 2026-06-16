@@ -143,8 +143,9 @@ pty_remove_symlink(const char *label)
     unlink(link);
 }
 
-/* forward declaration -- defined further down */
+/* forward declarations -- defined further down */
 static int find_port_by_path(monitor_state_t *state, const char *dev_path);
+static int port_needs_probe(const tty_port_t *p);
 
 /* ------------------------------------------------------------------ */
 /*  Status JSON                                                       */
@@ -206,9 +207,12 @@ write_status_json(monitor_state_t *state)
 
     fprintf(fp, "  ],\n");
 
-    /* scan all ports and include those not currently monitored */
+    /* scan all ports and include those not currently monitored. Cheap
+     * (sysfs-only) scan: status.json is written after every add / remove /
+     * hot-plug / reconcile / control command, so it must never trigger the
+     * blocking st-info / STM32_Programmer_CLI probe path. */
     tty_port_t all_ports[MAX_PORTS];
-    int nall = scan_all_ports(all_ports, MAX_PORTS);
+    int nall = scan_all_ports_cheap(all_ports, MAX_PORTS);
     board_id_t bids[MAX_BOARD_IDS];
     int nbids = load_board_config(bids, MAX_BOARD_IDS);
     if (nbids > 0)
@@ -798,9 +802,11 @@ handle_signal(monitor_state_t *state)
     case SIGHUP:
         printf("Received SIGHUP, rescanning ports...\n");
 
-        /* rescan and add any new ports */
+        /* rescan and add any new ports. Cheap (sysfs-only) identify on the
+         * event loop; ambiguous ports are resolved off-thread by the
+         * worker. */
         tty_port_t ports[MAX_PORTS];
-        int nports = scan_all_ports(ports, MAX_PORTS);
+        int nports = scan_all_ports_cheap(ports, MAX_PORTS);
 
         board_id_t bids[MAX_BOARD_IDS];
         int nbids = load_board_config(bids, MAX_BOARD_IDS);
@@ -810,6 +816,11 @@ handle_signal(monitor_state_t *state)
         for (int i = 0; i < nports; i++) {
             /* add_port checks for duplicates internally */
             add_port(state, &ports[i]);
+            /* probe only ports we are actually monitoring (respects the
+             * --only filter); the worker resolves the real board name. */
+            if (port_needs_probe(&ports[i]) &&
+                find_port_by_path(state, ports[i].dev_path) >= 0)
+                iw_submit(state->iw, ports[i].dev_path, 0);
         }
 
         write_status_json(state);
@@ -848,18 +859,65 @@ relabel_port(monitor_state_t *state, int idx, tty_port_t *fresh)
     add_port(state, fresh);
 }
 
+/* True if a cheaply-identified port still needs the background probe to
+ * resolve its real board name: a known but ambiguous device (e.g. an
+ * STLINK-V3 shared VID:PID) that the product string / ~/.boards pin did
+ * not already resolve. Non-ambiguous and pinned ports are final after the
+ * cheap identify, so we never probe them. */
+static int
+port_needs_probe(const tty_port_t *p)
+{
+    if (p->board_override && p->board_override[0])
+        return 0; /* pinned by ~/.boards -- label is authoritative */
+    if (p->board_match)
+        return 0; /* already resolved by USB product string */
+    return p->known && known_device_is_ambiguous(p->known);
+}
+
+/* Apply one resolved identity handed back by the identify worker. The
+ * worker only refines the *label* of a device whose serial is unchanged,
+ * so compare by label (identity_changed() keys on serial and would miss a
+ * generic->board upgrade). Stale results (device removed or swapped since
+ * submit) are dropped. Returns 1 if a port was relabeled. */
+static int
+apply_identify_result(monitor_state_t *state, const identify_result_t *r)
+{
+    board_id_t bids[MAX_BOARD_IDS];
+    tty_port_t fresh;
+    int idx, nbids;
+
+    idx = find_port_by_path(state, r->dev_path);
+    if (idx < 0)
+        return 0; /* device went away while the probe was in flight */
+    if (state->ports[idx].yielded)
+        return 0; /* held for flashing -- never touch */
+
+    /* the device behind the node must still be the one we probed */
+    if (strcmp(state->ports[idx].identity.serial, r->identity.serial) != 0)
+        return 0; /* swapped since submit -- a fresh event will re-probe */
+
+    fresh = r->identity;
+    nbids = load_board_config(bids, MAX_BOARD_IDS);
+    if (nbids > 0)
+        apply_board_config(&fresh, 1, bids, nbids);
+
+    if (strcmp(state->ports[idx].identity.label, fresh.label) == 0)
+        return 0; /* probe did not change the label (still generic) */
+
+    relabel_port(state, idx, &fresh);
+    return 1;
+}
+
 /* Periodic sweep: for each monitored port, cheaply re-read the sysfs USB
  * serial behind its tty node. If the node has gone, drop the port. If the
- * serial changed, the hardware behind the node was swapped -- run a full
- * re-identify (SWD probe) and relabel. Ports yielded for flashing are left
- * untouched. */
+ * serial changed, the hardware behind the node was swapped -- hand it to
+ * the identify worker to re-probe and relabel off the event loop. Ports
+ * yielded for flashing are left untouched. */
 static void
 reconcile_ports(monitor_state_t *state)
 {
     char serial[64];
-    tty_port_t fresh;
-    board_id_t bids[MAX_BOARD_IDS];
-    int i, rc, nbids, changed;
+    int i, rc, changed;
 
     changed = 0;
     for (i = 0; i < state->port_count; i++) {
@@ -882,18 +940,29 @@ reconcile_ports(monitor_state_t *state)
         if (strcmp(serial, mp->identity.serial) == 0)
             continue; /* same physical device -- nothing to do */
 
-        /* hardware behind this node changed -- re-identify and relabel */
-        identify_reset_probe_caches();
-        if (identify_port(mp->identity.dev_path, &fresh) != 0)
-            continue;
-        nbids = load_board_config(bids, MAX_BOARD_IDS);
-        if (nbids > 0)
-            apply_board_config(&fresh, 1, bids, nbids);
-        relabel_port(state, i, &fresh);
-        i--; /* idx i removed; loop re-examines the shifted element */
-        changed = 1;
+        /* hardware behind this node changed -- re-identify off-thread.
+         * No settle delay: the node is already enumerated. The worker's
+         * result is applied later via apply_identify_result(). */
+        iw_submit(state->iw, mp->identity.dev_path, 0);
     }
 
+    if (changed)
+        write_status_json(state);
+}
+
+/* Drain and apply all resolved identities the worker has posted. */
+static void
+handle_identify_done(monitor_state_t *state)
+{
+    identify_result_t results[MAX_PORTS];
+    int n, i, changed;
+
+    n = iw_drain(state->iw, results, MAX_PORTS);
+    changed = 0;
+    for (i = 0; i < n; i++) {
+        if (apply_identify_result(state, &results[i]))
+            changed = 1;
+    }
     if (changed)
         write_status_json(state);
 }
@@ -913,30 +982,11 @@ handle_hotplug(monitor_state_t *state)
     if (hev.action == HOTPLUG_ADD) {
         printf("  Hot-plug: %s added\n", hev.devpath);
 
-        /* Wait for the device to settle. Older ST-LINK V2-1 firmware
-         * (e.g. NUCLEO-L552ZE-Q with V2J38M27) can take longer than
-         * 200ms before STM32_Programmer_CLI sees the new probe on the
-         * USB bus, so give it a generous window. */
-        usleep(800000);
-
-        /* Drop any cached st-info / STM32_Programmer_CLI results. A
-         * recent hot-plug for a different device may have populated
-         * the cache without this one in it; we want a fresh probe. */
-        identify_reset_probe_caches();
-
+        /* Cheap (sysfs-only) identify so we can start logging immediately;
+         * the slow SWD/CLI probe runs off-thread in the identify worker.
+         * No usleep here -- the event loop must not stall. */
         tty_port_t port;
-        int rc = identify_port(hev.devpath, &port);
-
-        /* If we landed on the generic fallback label (ambiguous known
-         * device with no resolved board), the probe likely raced the
-         * USB enumeration. Wait a bit longer and try once more. */
-        if (rc == 0 && port.known &&
-            known_device_is_ambiguous(port.known) &&
-            !port.board_match) {
-            usleep(1500000);
-            identify_reset_probe_caches();
-            rc = identify_port(hev.devpath, &port);
-        }
+        int rc = identify_port_cheap(hev.devpath, &port);
 
         if (rc == 0) {
             /* apply board config */
@@ -959,6 +1009,15 @@ handle_hotplug(monitor_state_t *state)
                 add_port(state, &port);
 
             write_status_json(state);
+
+            /* hand off to the worker to resolve the real board name if the
+             * cheap label is still a generic/ambiguous fallback. Give a USB
+             * settle window since the device was just hot-plugged. Skip
+             * yielded ports. */
+            existing = find_port_by_path(state, hev.devpath);
+            if (existing >= 0 && !state->ports[existing].yielded &&
+                port_needs_probe(&state->ports[existing].identity))
+                iw_submit(state->iw, hev.devpath, 800);
         }
     } else if (hev.action == HOTPLUG_REMOVE) {
         printf("  Hot-plug: %s removed\n", hev.devpath);
@@ -1009,6 +1068,8 @@ cmd_monitor(int argc, char *argv[])
     state.hotplug_fd = -1;
     state.control_fd = -1;
     state.reconcile_fd = -1;
+    state.identify_fd = -1;
+    state.iw = NULL;
 
     int foreground = 0;
 
@@ -1070,9 +1131,12 @@ cmd_monitor(int argc, char *argv[])
            state.proxy_mode ? " (proxy mode)" : "");
     printf("Session: %s\n", state.session_path);
 
-    /* scan and identify ports */
+    /* scan and identify ports. Cheap (sysfs-only) identify so the daemon
+     * comes up and signals systemd READY in milliseconds even with many
+     * ST-LINK probes attached; the slow SWD/CLI probe that resolves
+     * ambiguous boards runs afterward in the identify worker. */
     tty_port_t ports[MAX_PORTS];
-    int nports = scan_all_ports(ports, MAX_PORTS);
+    int nports = scan_all_ports_cheap(ports, MAX_PORTS);
 
     /* load board config */
     board_id_t bids[MAX_BOARD_IDS];
@@ -1151,9 +1215,36 @@ cmd_monitor(int argc, char *argv[])
         epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.control_fd, &ev);
     }
 
+    /* start the identify worker. Created after sigprocmask() so the worker
+     * thread (and any probe subprocess it forks) inherits the blocked
+     * signal mask -- signals are handled only via signalfd on this thread.
+     * The eventfd becomes readable when resolved identities are pending. */
+    state.iw = iw_start(&state.identify_fd);
+    if (state.iw != NULL && state.identify_fd >= 0) {
+        state.evt_identify.type = EVT_IDENTIFY_DONE;
+        state.evt_identify.fd = state.identify_fd;
+        struct epoll_event ev = {
+            .events = EPOLLIN,
+            .data.ptr = &state.evt_identify
+        };
+        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.identify_fd, &ev);
+    } else {
+        fprintf(stderr, "monitor: identify worker failed to start; "
+                        "ambiguous boards keep generic labels\n");
+    }
+
     /* open all serial ports */
     for (int i = 0; i < nports; i++)
         add_port(&state, &ports[i]);
+
+    /* resolve ambiguous board names off-thread (no settle delay: these
+     * devices are already enumerated at startup). Only probe ports we are
+     * actually monitoring, so a --only filter is not bypassed. */
+    for (int i = 0; i < nports; i++) {
+        if (port_needs_probe(&ports[i]) &&
+            find_port_by_path(&state, ports[i].dev_path) >= 0)
+            iw_submit(state.iw, ports[i].dev_path, 0);
+    }
 
     /* write initial status */
     write_status_json(&state);
@@ -1228,6 +1319,14 @@ cmd_monitor(int argc, char *argv[])
                 i = nfds;
                 break;
             }
+
+            case EVT_IDENTIFY_DONE:
+                /* worker resolved one or more board labels; apply them.
+                 * relabel shifts ports[] and invalidates the rest of this
+                 * batch's event pointers -- stop processing this iteration. */
+                handle_identify_done(&state);
+                i = nfds;
+                break;
 
             case EVT_CONTROL: {
                 /* accept new control client */
@@ -1327,6 +1426,11 @@ cmd_monitor(int argc, char *argv[])
 
     /* ---- cleanup ---- */
     printf("Shutting down...\n");
+
+    /* stop the identify worker first so no relabel races the teardown.
+     * iw_stop() bounds its wait so a wedged probe cannot hang shutdown. */
+    iw_stop(state.iw);
+    state.iw = NULL;
 
     for (int i = state.port_count - 1; i >= 0; i--) {
         monitored_port_t *mp = &state.ports[i];
