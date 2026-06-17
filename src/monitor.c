@@ -993,11 +993,64 @@ apply_identify_result(monitor_state_t *state, const identify_result_t *r)
     return 1;
 }
 
+/* Cheap sysfs rescan: add any monitor-eligible /dev node that is present
+ * but not currently in the table. This recovers a port whose hot-plug
+ * add() failed transiently -- most commonly when the open() raced udev and
+ * hit EACCES because the plugdev group / ACL had not been applied to the
+ * freshly created node yet -- without waiting for a manual SIGHUP or a
+ * daemon restart. Mirrors the SIGHUP rescan path. Returns the number of
+ * ports newly added. */
+static int
+rescan_and_add(monitor_state_t *state)
+{
+    tty_port_t ports[MAX_PORTS];
+    board_id_t bids[MAX_BOARD_IDS];
+    int nports, nbids, i, added;
+
+    nports = scan_all_ports_cheap(ports, MAX_PORTS);
+    nbids = load_board_config(bids, MAX_BOARD_IDS);
+    if (nbids > 0)
+        apply_board_config(ports, nports, bids, nbids);
+
+    added = 0;
+    for (i = 0; i < nports; i++) {
+        if (find_port_by_path(state, ports[i].dev_path) >= 0)
+            continue; /* already monitoring */
+        if (add_port(state, &ports[i]) < 0)
+            continue; /* filtered out, or still failing -- retry next pass */
+        added++;
+        /* resolve the real board name off-thread if still ambiguous */
+        if (port_needs_probe(&ports[i]) &&
+            find_port_by_path(state, ports[i].dev_path) >= 0)
+            iw_submit(state->iw, ports[i].dev_path, 0);
+    }
+    return added;
+}
+
+/* Arm the reconcile timer for a near-term one-shot fire, then resume its
+ * normal cadence. Used to retry a transient hot-plug add() failure within
+ * ~1s (the udev ACL race resolves in tens of ms) instead of leaving the
+ * port dark until the next full reconcile interval. */
+static void
+schedule_fast_reconcile(monitor_state_t *state)
+{
+    struct itimerspec its;
+
+    if (state->reconcile_fd < 0)
+        return;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_nsec = 800 * 1000 * 1000; /* first fire in 800ms */
+    its.it_interval.tv_sec = RECONCILE_INTERVAL_SEC;
+    timerfd_settime(state->reconcile_fd, 0, &its, NULL);
+}
+
 /* Periodic sweep: for each monitored port, cheaply re-read the sysfs USB
  * serial behind its tty node. If the node has gone, drop the port. If the
  * serial changed, the hardware behind the node was swapped -- hand it to
  * the identify worker to re-probe and relabel off the event loop. Ports
- * yielded for flashing are left untouched. */
+ * yielded for flashing are left untouched. Finally, pick up any eligible
+ * node that is present but not monitored (self-heal for a transient add
+ * failure). */
 static void
 reconcile_ports(monitor_state_t *state)
 {
@@ -1030,6 +1083,13 @@ reconcile_ports(monitor_state_t *state)
          * result is applied later via apply_identify_result(). */
         iw_submit(state->iw, mp->identity.dev_path, 0);
     }
+
+    /* Self-heal: re-add any eligible node that is present but not currently
+     * monitored. Recovers a port whose hot-plug add() failed transiently
+     * (e.g. the open raced udev's ACL and got EACCES) instead of leaving it
+     * dark until the next SIGHUP / restart. */
+    if (rescan_and_add(state) > 0)
+        changed = 1;
 
     if (changed)
         write_status_json(state);
@@ -1103,6 +1163,14 @@ handle_hotplug(monitor_state_t *state)
             if (existing >= 0 && !state->ports[existing].yielded &&
                 port_needs_probe(&state->ports[existing].identity))
                 iw_submit(state->iw, hev.devpath, 800);
+
+            /* If the add failed, the node is enumerated but not monitored --
+             * most often the open raced udev's ACL and got EACCES. Arm a
+             * fast reconcile to retry shortly rather than leaving it dark
+             * until the periodic sweep. */
+            if (existing < 0 &&
+                port_matches_filter(hev.devpath, state->only_filter))
+                schedule_fast_reconcile(state);
         }
     } else if (hev.action == HOTPLUG_REMOVE) {
         printf("  Hot-plug: %s removed\n", hev.devpath);
