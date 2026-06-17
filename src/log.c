@@ -30,13 +30,29 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Resolve the base directory for session logs. Honors the UART_MONITOR_DIR
+ * environment override so tests (and ad-hoc runs) can redirect logging to a
+ * scratch directory instead of the shared production tree -- where creating
+ * a session hijacks the "latest" symlink and pruning can delete live board
+ * logs. Falls back to the compile-time default when unset/empty. */
+static const char *
+log_base_dir(void)
+{
+    const char *env = getenv("UART_MONITOR_DIR");
+    if (env != NULL && env[0] != '\0')
+        return env;
+    return LOG_BASE_DIR;
+}
+
 int
 log_create_session(char *session_path, size_t sz)
 {
+    const char *base = log_base_dir();
+
     /* ensure base dir exists */
-    if (mkdirp(LOG_BASE_DIR) < 0) {
+    if (mkdirp(base) < 0) {
         fprintf(stderr, "log: cannot create %s: %s\n",
-                LOG_BASE_DIR, strerror(errno));
+                base, strerror(errno));
         return -1;
     }
 
@@ -46,7 +62,7 @@ log_create_session(char *session_path, size_t sz)
 
     char session_name[64];
     snprintf(session_name, sizeof(session_name), "session-%s", ts);
-    snprintf(session_path, sz, "%s/%s", LOG_BASE_DIR, session_name);
+    snprintf(session_path, sz, "%s/%s", base, session_name);
 
     if (mkdir(session_path, 0755) < 0 && errno != EEXIST) {
         fprintf(stderr, "log: cannot create %s: %s\n",
@@ -56,7 +72,7 @@ log_create_session(char *session_path, size_t sz)
 
     /* update "latest" symlink */
     char linkpath[512];
-    snprintf(linkpath, sizeof(linkpath), "%s/latest", LOG_BASE_DIR);
+    snprintf(linkpath, sizeof(linkpath), "%s/latest", base);
     symlink_update(session_name, linkpath);
 
     return 0;
@@ -251,7 +267,8 @@ cmp_str(const void *a, const void *b)
 int
 log_prune_sessions(int keep)
 {
-    DIR *dir = opendir(LOG_BASE_DIR);
+    const char *base = log_base_dir();
+    DIR *dir = opendir(base);
     if (!dir)
         return -1;
 
@@ -281,7 +298,7 @@ log_prune_sessions(int keep)
     int to_remove = count - keep;
     for (int i = 0; i < to_remove; i++) {
         char path[512];
-        snprintf(path, sizeof(path), "%s/%s", LOG_BASE_DIR, sessions[i]);
+        snprintf(path, sizeof(path), "%s/%s", base, sessions[i]);
 
         /* remove all files in the session directory */
         DIR *sdir = opendir(path);

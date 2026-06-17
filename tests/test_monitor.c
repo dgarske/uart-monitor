@@ -409,7 +409,20 @@ test_proxy_log_and_forward(void)
 
 int main(void)
 {
+    char tmpl[] = "/tmp/uart-monitor-test-XXXXXX";
+    char *scratch;
+
     printf("=== test_monitor ===\n");
+
+    /* Isolate all session logging into a private scratch dir so the suite
+     * never writes into the shared /tmp/uart-monitor tree -- where creating
+     * a session hijacks the "latest" symlink and log_prune_sessions() can
+     * delete live board logs. The log layer honors UART_MONITOR_DIR. */
+    scratch = mkdtemp(tmpl);
+    if (scratch != NULL)
+        setenv("UART_MONITOR_DIR", scratch, 1);
+    else
+        fprintf(stderr, "  (warning: mkdtemp failed, using default log dir)\n");
 
     test_log_create_session();
     test_log_write_timestamps();
@@ -422,6 +435,14 @@ int main(void)
 
     printf("\n  Results: %d passed, %d failed\n\n",
            tests_passed, tests_failed);
+
+    /* best-effort cleanup of the scratch tree */
+    if (scratch != NULL) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", scratch);
+        if (system(cmd) != 0)
+            fprintf(stderr, "  (warning: could not remove %s)\n", scratch);
+    }
 
     return tests_failed > 0 ? 1 : 0;
 }
