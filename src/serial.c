@@ -23,7 +23,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <pty.h>
+#ifdef __APPLE__
+#include <util.h>       /* openpty() lives in libutil (part of libSystem) */
+#else
+#include <pty.h>        /* openpty() (glibc) */
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -171,13 +175,38 @@ baud_to_speed(int baud)
     case 57600:   return B57600;
     case 115200:  return B115200;
     case 230400:  return B230400;
+    /* High baud constants are not defined on all platforms (macOS termios
+     * stops at B230400). Guard each; on macOS the fall-through below
+     * returns the literal integer speed, which Darwin's termios accepts. */
+#ifdef B460800
     case 460800:  return B460800;
+#endif
+#ifdef B921600
     case 921600:  return B921600;
+#endif
+#ifdef B1000000
     case 1000000: return B1000000;
+#endif
+#ifdef B1500000
     case 1500000: return B1500000;
+#endif
+#ifdef B2000000
     case 2000000: return B2000000;
+#endif
+#ifdef B3000000
     case 3000000: return B3000000;
+#endif
+#ifdef B4000000
     case 4000000: return B4000000;
-    default:      return B115200;
+#endif
+    default:      break;
     }
+
+#ifdef __APPLE__
+    /* Darwin accepts an arbitrary integer as the termios speed (the Bxxx
+     * constants are themselves defined as their integer values). */
+    if (baud > 0)
+        return (speed_t)baud;
+#endif
+    return B115200;
 }

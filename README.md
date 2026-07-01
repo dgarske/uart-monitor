@@ -14,16 +14,37 @@ simply `tail -f` the log files.
 - **Two operating modes**:
   - **Read-only** (default) -- opens ports `O_RDONLY`, never writes to UARTs
   - **PTY proxy** (`--proxy`) -- bidirectional forwarding via pseudo-terminals
-- **Device identification** -- reads sysfs to identify boards by USB VID:PID
-  (VMK180, ZCU102, PolarFire SoC, STM32, FTDI, CP210x, etc.)
+- **Cross-platform** -- Linux and macOS from one codebase (see Platform
+  Support below)
+- **Device identification** -- identifies boards by USB VID:PID via sysfs
+  (Linux) or IOKit (macOS): VMK180, ZCU102, PolarFire SoC, STM32, FTDI,
+  CP210x, etc.
 - **Hardware-named log files** -- logs use board labels (e.g.,
   `POLARFIRE_SOC_UART0.log`) instead of raw tty names
 - **Hot-plug detection** -- automatically starts/stops monitoring when USB
-  devices are plugged in or removed (via netlink KOBJECT_UEVENT)
+  devices are plugged in or removed (netlink KOBJECT_UEVENT on Linux, IOKit
+  matching notifications on macOS)
 - **Yield/reclaim** -- release a port for flashing, then reclaim it
-- **systemd integration** -- `Type=notify` user service, starts at login
+- **Service integration** -- systemd `Type=notify` user service (Linux) or
+  launchd LaunchAgent (macOS), starts at login
 - **Session-based logging** -- timestamped log files with automatic pruning
-- **epoll event loop** -- single-threaded, handles all I/O without threads
+- **poll() event loop** -- single portable event loop for all I/O
+
+## Platform Support
+
+Runs on Linux and macOS. The two OSes share all core logic; only the
+device-identity backend, hot-plug backend, and service integration differ.
+
+| Concern            | Linux                          | macOS                              |
+| ------------------ | ------------------------------ | ---------------------------------- |
+| Serial device glob | `/dev/ttyUSB*`, `ttyACM*`, `ttyUART*` | `/dev/cu.usbserial*`, `cu.usbmodem*` |
+| USB identity       | sysfs (`identify_linux.c`)     | IOKit registry (`identify_macos.c`) |
+| Hot-plug           | netlink / inotify (`hotplug_linux.c`) | IOKit notifications (`hotplug_macos.c`) |
+| Service            | systemd user unit              | launchd LaunchAgent                |
+
+On macOS, open the call-out nodes (`/dev/cu.*`), not the dial-in nodes
+(`/dev/tty.*`) which block on carrier detect. `make` auto-selects the
+backend via `uname -s`.
 
 ## Quick Start
 
@@ -52,6 +73,8 @@ tail -f /tmp/uart-monitor/latest/ttyUSB0.log    # symlink also works
 
 ## Installation
 
+### Linux (systemd)
+
 ```bash
 # Install binary to ~/.local/bin/ and systemd service
 make install
@@ -67,6 +90,22 @@ journalctl --user -u uart-monitor -f
 
 # Restart
 systemctl --user restart uart-monitor
+```
+
+### macOS (launchd)
+
+```bash
+# Install binary to ~/.local/bin/ and the LaunchAgent plist
+make install
+
+# Enable auto-start at login (make install prints these commands)
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wolfssl.uart-monitor.plist
+
+# Stop / disable
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.wolfssl.uart-monitor.plist
+
+# Daemon logs (launchd has no journal; stdout/stderr go here)
+tail -f /tmp/uart-monitor/daemon.log
 ```
 
 ## Usage
@@ -288,7 +327,7 @@ the same port for writing.
 
 The monitor opens serial ports with `O_RDWR | O_NOCTTY | O_NONBLOCK` and sets
 `TIOCEXCL` for exclusive access. It creates a `openpty()` pair for each port
-and adds both the real serial fd and the PTY master fd to the epoll loop:
+and adds both the real serial fd and the PTY master fd to the poll() loop:
 
 - **Real serial fd readable** -> data is logged AND written to PTY master
 - **PTY master readable** -> data from PTY slave is written to real serial fd
@@ -299,20 +338,26 @@ bypassing the proxy by opening the real device directly.
 
 ### Architecture
 
-Single-threaded `epoll` event loop multiplexing:
+Single portable `poll()` event loop multiplexing:
 - Serial port reads (one fd per monitored device)
 - PTY master reads (proxy mode: one fd per proxied device)
-- Netlink `KOBJECT_UEVENT` socket (hot-plug detection)
+- Hot-plug fd (Linux: netlink/inotify directly; macOS: read end of a
+  self-pipe fed by an IOKit notification thread)
 - Unix domain socket (control commands)
-- `signalfd` (SIGTERM/SIGINT/SIGHUP)
+- Signal self-pipe (SIGTERM/SIGINT/SIGHUP)
+- A periodic reconcile timer, driven by the `poll()` timeout deadline
 
-No threads, no locks, no heap allocation in the read loop.
+Portable primitives replace the earlier Linux-only stack: `poll()` for
+`epoll`, a self-pipe for `signalfd`, the `poll()` timeout for `timerfd`,
+and a self-pipe for the identify worker's `eventfd`. A background thread
+runs board identification (and, on macOS, the IOKit hot-plug run loop).
 
-### systemd Integration
+### Service Integration
 
-The `sd_notify` protocol is implemented directly (~20 lines of C sending a
-datagram to `$NOTIFY_SOCKET`). No `libsystemd` linkage is needed. The binary
-is fully self-contained.
+On Linux the `sd_notify` readiness protocol is implemented directly (~20
+lines of C sending a datagram to `$NOTIFY_SOCKET`); no `libsystemd` linkage
+is needed. On macOS launchd handles readiness via `RunAtLoad`/`KeepAlive`,
+so `--systemd` is a no-op there. The binary is fully self-contained.
 
 ## Concurrent Access / Port Sharing
 
@@ -405,10 +450,15 @@ Serial matches are authoritative (they bypass the VID:PID compatibility check), 
 
 ```bash
 make            # Build with -Wall -Wextra -Werror -pedantic -std=c11
-make test       # Run PTY-based unit tests (21 tests)
-make install    # Install binary + systemd service
+make test       # Run PTY-based unit tests
+make install    # Install binary + systemd service (Linux) / launchd agent (macOS)
 make uninstall  # Remove everything
 make clean      # Remove build artifacts
 ```
 
-Requirements: Linux, GCC, glibc. No external libraries.
+`make` selects the platform backend automatically via `uname -s`.
+
+Requirements:
+- **Linux**: GCC or Clang, glibc. No external libraries.
+- **macOS**: Clang (Xcode command-line tools). Links the system IOKit and
+  CoreFoundation frameworks; no third-party libraries.

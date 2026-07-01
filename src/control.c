@@ -34,9 +34,12 @@
 int
 control_init(const char *sock_path)
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    /* plain socket + fcntl (portable): macOS does not accept
+     * SOCK_NONBLOCK / SOCK_CLOEXEC in the socket() type argument. */
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
+    set_nonblock_cloexec(fd);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -248,16 +251,22 @@ cmd_tail(int argc, char *argv[])
      * "latest" session symlink being repointed on a new session; plain
      * "-f" would cling to a stale fd after rotation.
      *
-     * "---disable-inotify" (GNU coreutils, Linux-only -- this daemon is
-     * Linux-only) forces tail to poll instead of using inotify. Serial
-     * logs are low volume so the 1s poll latency is fine, and it avoids
-     * the per-user inotify-instance limit: without it, once that limit
-     * is exhausted (VS Code, browsers, etc.) tail prints
-     * "inotify cannot be used, reverting to polling: Too many open
-     * files" to stderr. Polling sidesteps the warning entirely and
-     * consumes zero inotify instances. */
+     * On Linux "---disable-inotify" (GNU coreutils) forces tail to poll
+     * instead of using inotify. Serial logs are low volume so the 1s poll
+     * latency is fine, and it avoids the per-user inotify-instance limit:
+     * without it, once that limit is exhausted (VS Code, browsers, etc.)
+     * tail prints "inotify cannot be used, reverting to polling: Too many
+     * open files" to stderr. Polling sidesteps the warning entirely and
+     * consumes zero inotify instances. macOS ships BSD tail, which does
+     * not understand that flag (and uses kqueue, not inotify), so it is
+     * omitted there. */
+#ifdef __APPLE__
+    char *tail_argv[] = { (char *)"tail", (char *)"-F",
+                          logpath, NULL };
+#else
     char *tail_argv[] = { (char *)"tail", (char *)"-F",
                           (char *)"---disable-inotify", logpath, NULL };
+#endif
     execvp("tail", tail_argv);
     /* execvp returns only on failure */
     fprintf(stderr, "execvp tail: %s\n", strerror(errno));

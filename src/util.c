@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 #include "util.h"
+#include "log.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -75,6 +76,25 @@ strlcpy_safe(char *dst, const char *src, size_t sz)
         n = sz - 1;
     memcpy(dst, src, n);
     dst[n] = '\0';
+}
+
+int
+set_nonblock_cloexec(int fd)
+{
+    int fl;
+
+    if (fd < 0)
+        return -1;
+
+    fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
+        return -1;
+
+    fl = fcntl(fd, F_GETFD);
+    if (fl < 0 || fcntl(fd, F_SETFD, fl | FD_CLOEXEC) < 0)
+        return -1;
+
+    return 0;
 }
 
 void
@@ -185,7 +205,7 @@ status_lookup(const char *device_or_label,
     if (device_or_label == NULL)
         return -1;
 
-    FILE *fp = fopen("/tmp/uart-monitor/status.json", "r");
+    FILE *fp = fopen(LOG_BASE_DIR "/status.json", "r");
     if (fp == NULL)
         return -1;
 

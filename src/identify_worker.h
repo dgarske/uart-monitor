@@ -31,7 +31,7 @@
  * immediately under a cheap provisional label and submits the device
  * path here. A dedicated worker thread runs the slow probe and hands the
  * resolved identity back via a result queue; the main thread is woken by
- * an eventfd and applies the new label (relabel) when it is ready.
+ * a self-pipe and applies the new label (relabel) when it is ready.
  */
 
 typedef struct identify_worker identify_worker_t;
@@ -44,8 +44,8 @@ typedef struct {
 } identify_result_t;
 
 /* Start the worker thread. On success returns a handle and stores a
- * readable eventfd in *event_fd_out (add it to epoll; it becomes
- * readable when one or more results are pending). Returns NULL on
+ * readable self-pipe fd in *event_fd_out (add it to the poll() set; it
+ * becomes readable when one or more results are pending). Returns NULL on
  * failure, in which case *event_fd_out is set to -1. */
 identify_worker_t *iw_start(int *event_fd_out);
 
@@ -56,12 +56,12 @@ identify_worker_t *iw_start(int *event_fd_out);
  * are already queued or in flight. No-op if iw is NULL. */
 void iw_submit(identify_worker_t *iw, const char *dev_path, int settle_ms);
 
-/* Drain up to max ready results into out[] (main thread, on the eventfd
- * event). Returns the number copied and re-arms the eventfd if more
+/* Drain up to max ready results into out[] (main thread, on the self-pipe
+ * event). Returns the number copied and re-arms the self-pipe if more
  * results remain. Returns 0 if iw is NULL. */
 int iw_drain(identify_worker_t *iw, identify_result_t *out, int max);
 
-/* Stop and join the worker, close the eventfd, free the handle. Safe to
+/* Stop and join the worker, close the self-pipe, free the handle. Safe to
  * call with NULL. */
 void iw_stop(identify_worker_t *iw);
 

@@ -25,20 +25,22 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/timerfd.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_EPOLL_EVENTS  (MAX_PORTS * 2 + 16)
+/* poll() set size: each port contributes a serial fd and (in proxy mode)
+ * a PTY master, plus a handful of fixed sources (signal / hot-plug /
+ * control / identify). */
+#define MAX_POLL_FDS      (MAX_PORTS * 2 + 16)
 #define READ_BUF_SIZE     4096
 #define PID_FILE          LOG_BASE_DIR "/uart-monitor.pid"
 #define STATUS_FILE       LOG_BASE_DIR "/status.json"
@@ -60,9 +62,12 @@ sd_notify_send(const char *state)
     if (!sock)
         return;
 
-    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    /* plain SOCK_DGRAM (portable): SOCK_CLOEXEC in the type is Linux-only.
+     * The fd is closed immediately after the send. */
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (fd < 0)
         return;
+    set_nonblock_cloexec(fd);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -82,6 +87,26 @@ sd_notify_send(const char *state)
            (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
                        strlen(sock)));
     close(fd);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Signal handling via self-pipe                                     */
+/*                                                                    */
+/*  Portable replacement for Linux signalfd: an async-signal-safe     */
+/*  handler writes the signal number as one byte to a pipe whose read */
+/*  end sits in the main poll() set. write() is async-signal-safe.    */
+/* ------------------------------------------------------------------ */
+
+static int g_signal_pipe_w = -1;
+
+static void
+signal_handler(int signo)
+{
+    unsigned char b = (unsigned char)signo;
+    if (g_signal_pipe_w >= 0) {
+        ssize_t wr = write(g_signal_pipe_w, &b, 1);
+        (void)wr;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -368,37 +393,18 @@ add_port(monitor_state_t *state, tty_port_t *identity)
         }
     }
 
-    /* add serial fd to epoll */
+    /* tag the serial fd for poll() dispatch. The pollfd set is rebuilt
+     * from the ports array each loop iteration, so there is no epoll
+     * registration to maintain here. */
     mp->evt.type = EVT_SERIAL;
     mp->evt.index = idx;
     mp->evt.fd = mp->serial.fd;
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.ptr = &mp->evt;
-    if (epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD,
-                  mp->serial.fd, &ev) < 0) {
-        fprintf(stderr, "monitor: epoll_ctl add %s: %s\n",
-                identity->dev_path, strerror(errno));
-        log_close(&mp->log);
-        serial_close(&mp->serial);
-        return -1;
-    }
-
-    /* if proxy mode, also add PTY master to epoll */
+    /* if proxy mode, tag the PTY master and create its symlink */
     if (mp->serial.pty_master >= 0) {
         mp->evt_pty.type = EVT_PTY;
         mp->evt_pty.index = idx;
         mp->evt_pty.fd = mp->serial.pty_master;
-
-        ev.events = EPOLLIN;
-        ev.data.ptr = &mp->evt_pty;
-        if (epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD,
-                      mp->serial.pty_master, &ev) < 0) {
-            fprintf(stderr, "monitor: epoll_ctl add pty %s: %s\n",
-                    identity->dev_path, strerror(errno));
-            /* non-fatal: serial monitoring still works */
-        }
 
         /* create PTY symlink */
         pty_create_symlink(identity->label, mp->serial.pty_path);
@@ -427,16 +433,8 @@ remove_port(monitor_state_t *state, int idx)
 
     monitored_port_t *mp = &state->ports[idx];
 
-    /* remove PTY master from epoll */
-    if (mp->serial.pty_master >= 0) {
-        epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL,
-                  mp->serial.pty_master, NULL);
+    if (mp->serial.pty_master >= 0)
         pty_remove_symlink(mp->identity.label);
-    }
-
-    /* remove serial fd from epoll */
-    if (mp->serial.fd >= 0)
-        epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, mp->serial.fd, NULL);
 
     log_marker(&mp->log, "PORT DISCONNECTED");
     log_close(&mp->log);
@@ -445,26 +443,12 @@ remove_port(monitor_state_t *state, int idx)
     printf("  Removed: %s [%s]\n",
            mp->identity.dev_path, mp->identity.label);
 
-    /* shift remaining ports down */
+    /* shift remaining ports down; the poll() set is rebuilt next
+     * iteration, so only the per-slot dispatch index needs fixing up. */
     for (int i = idx; i < state->port_count - 1; i++) {
         state->ports[i] = state->ports[i + 1];
         state->ports[i].evt.index = i;
         state->ports[i].evt_pty.index = i;
-        /* re-register with epoll using updated index */
-        if (state->ports[i].serial.fd >= 0 && !state->ports[i].yielded) {
-            struct epoll_event ev;
-            ev.events = EPOLLIN;
-            ev.data.ptr = &state->ports[i].evt;
-            epoll_ctl(state->epoll_fd, EPOLL_CTL_MOD,
-                      state->ports[i].serial.fd, &ev);
-        }
-        if (state->ports[i].serial.pty_master >= 0) {
-            struct epoll_event ev;
-            ev.events = EPOLLIN;
-            ev.data.ptr = &state->ports[i].evt_pty;
-            epoll_ctl(state->epoll_fd, EPOLL_CTL_MOD,
-                      state->ports[i].serial.pty_master, &ev);
-        }
     }
     state->port_count--;
 }
@@ -519,14 +503,10 @@ yield_port(monitor_state_t *state, int idx, char *resp, size_t resp_sz)
         return;
     }
 
-    /* remove PTY master from epoll (keep PTY alive for reconnect) */
-    if (mp->serial.pty_master >= 0)
-        epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL,
-                  mp->serial.pty_master, NULL);
-
-    /* remove serial fd from epoll and close it */
+    /* close the serial fd (the poll() set skips yielded ports when it is
+     * rebuilt). The PTY master fd stays open so the slave survives for the
+     * reader to reconnect after reclaim. */
     if (mp->serial.fd >= 0) {
-        epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, mp->serial.fd, NULL);
         close(mp->serial.fd);
         mp->serial.fd = -1;
     }
@@ -583,27 +563,9 @@ reclaim_port(monitor_state_t *state, int idx, char *resp, size_t resp_sz)
     tty.c_cc[VTIME] = 0;
     tcsetattr(mp->serial.fd, TCSANOW, &tty);
 
-    /* re-add serial fd to epoll */
+    /* refresh the dispatch fd; the poll() set picks the reopened serial
+     * fd back up on the next loop rebuild (yielded flag cleared below). */
     mp->evt.fd = mp->serial.fd;
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.ptr = &mp->evt;
-    if (epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD,
-                  mp->serial.fd, &ev) < 0) {
-        close(mp->serial.fd);
-        mp->serial.fd = -1;
-        snprintf(resp, resp_sz, "ERROR epoll add failed for %s\n",
-                 mp->identity.dev_path);
-        return;
-    }
-
-    /* re-add PTY master to epoll if proxying */
-    if (mp->serial.pty_master >= 0) {
-        ev.events = EPOLLIN;
-        ev.data.ptr = &mp->evt_pty;
-        epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD,
-                  mp->serial.pty_master, &ev);
-    }
 
     mp->yielded = 0;
     log_marker(&mp->log, "PORT RECLAIMED (monitoring resumed)");
@@ -737,9 +699,10 @@ handle_control_cmd(monitor_state_t *state, int client_fd)
                 } else {
                     struct termios tty;
                     if (tcgetattr(mp->serial.fd, &tty) == 0) {
+                        /* cfset*speed sets the baud portably; no CBAUD
+                         * masking (Linux-only) needed. */
                         cfsetispeed(&tty, spd);
                         cfsetospeed(&tty, spd);
-                        tty.c_cflag = (tty.c_cflag & ~CBAUD) | spd;
                         tcsetattr(mp->serial.fd, TCSANOW, &tty);
                         mp->identity.baud = rate;
                         snprintf(resp, sizeof(resp),
@@ -786,20 +749,22 @@ handle_control_cmd(monitor_state_t *state, int client_fd)
 static void
 handle_signal(monitor_state_t *state)
 {
-    struct signalfd_siginfo si;
-    ssize_t n = read(state->signal_fd, &si, sizeof(si));
-    if (n != sizeof(si))
-        return;
+    unsigned char b;
+    ssize_t n;
 
-    switch (si.ssi_signo) {
+    /* Drain every byte the signal handler queued; act on each signal. */
+    while ((n = read(state->signal_fd, &b, 1)) > 0) {
+    int signo = (int)b;
+
+    switch (signo) {
     case SIGTERM:
     case SIGINT:
         printf("\nReceived SIG%s, shutting down...\n",
-               si.ssi_signo == SIGTERM ? "TERM" : "INT");
+               signo == SIGTERM ? "TERM" : "INT");
         state->running = 0;
         break;
 
-    case SIGHUP:
+    case SIGHUP: {
         printf("Received SIGHUP, rescanning ports...\n");
 
         /* rescan and add any new ports. Cheap (sysfs-only) identify on the
@@ -825,6 +790,8 @@ handle_signal(monitor_state_t *state)
 
         write_status_json(state);
         break;
+    }
+    }
     }
 }
 
@@ -1027,21 +994,28 @@ rescan_and_add(monitor_state_t *state)
     return added;
 }
 
-/* Arm the reconcile timer for a near-term one-shot fire, then resume its
- * normal cadence. Used to retry a transient hot-plug add() failure within
- * ~1s (the udev ACL race resolves in tens of ms) instead of leaving the
- * port dark until the next full reconcile interval. */
+/* Bring the next reconcile forward to ~800ms from now (unless one is
+ * already due sooner). Used to retry a transient hot-plug add() failure
+ * quickly (the udev ACL race resolves in tens of ms) instead of leaving
+ * the port dark until the next full reconcile interval. */
 static void
 schedule_fast_reconcile(monitor_state_t *state)
 {
-    struct itimerspec its;
+    struct timespec now;
+    struct timespec soon;
 
-    if (state->reconcile_fd < 0)
-        return;
-    memset(&its, 0, sizeof(its));
-    its.it_value.tv_nsec = 800 * 1000 * 1000; /* first fire in 800ms */
-    its.it_interval.tv_sec = RECONCILE_INTERVAL_SEC;
-    timerfd_settime(state->reconcile_fd, 0, &its, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    soon = now;
+    soon.tv_nsec += 800 * 1000 * 1000; /* +800ms */
+    if (soon.tv_nsec >= 1000000000L) {
+        soon.tv_nsec -= 1000000000L;
+        soon.tv_sec += 1;
+    }
+
+    if (soon.tv_sec < state->reconcile_deadline.tv_sec ||
+        (soon.tv_sec == state->reconcile_deadline.tv_sec &&
+         soon.tv_nsec < state->reconcile_deadline.tv_nsec))
+        state->reconcile_deadline = soon;
 }
 
 /* Periodic sweep: for each monitored port, cheaply re-read the sysfs USB
@@ -1216,11 +1190,9 @@ cmd_monitor(int argc, char *argv[])
     memset(&state, 0, sizeof(state));
     state.running = 1;
     state.baudrate = B115200;
-    state.epoll_fd = -1;
     state.signal_fd = -1;
     state.hotplug_fd = -1;
     state.control_fd = -1;
-    state.reconcile_fd = -1;
     state.identify_fd = -1;
     state.iw = NULL;
 
@@ -1299,31 +1271,31 @@ cmd_monitor(int argc, char *argv[])
 
     printf("Found %d serial port(s)\n", nports);
 
-    /* create epoll */
-    state.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (state.epoll_fd < 0) {
-        fprintf(stderr, "monitor: epoll_create1: %s\n", strerror(errno));
-        pidfile_remove();
-        return 1;
-    }
+    /* setup signal self-pipe: an async-signal-safe handler writes the
+     * signal number to the pipe; its read end sits in the poll() set. */
+    {
+        int sp[2];
+        if (pipe(sp) == 0 &&
+            set_nonblock_cloexec(sp[0]) == 0 &&
+            set_nonblock_cloexec(sp[1]) == 0) {
+            state.signal_fd = sp[0];
+            g_signal_pipe_w = sp[1];
 
-    /* setup signalfd */
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGHUP);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = signal_handler;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = SA_RESTART;
+            sigaction(SIGTERM, &sa, NULL);
+            sigaction(SIGINT, &sa, NULL);
+            sigaction(SIGHUP, &sa, NULL);
 
-    state.signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
-    if (state.signal_fd >= 0) {
-        state.evt_signal.type = EVT_SIGNAL;
-        state.evt_signal.fd = state.signal_fd;
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data.ptr = &state.evt_signal
-        };
-        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.signal_fd, &ev);
+            state.evt_signal.type = EVT_SIGNAL;
+            state.evt_signal.fd = state.signal_fd;
+        } else {
+            fprintf(stderr, "monitor: signal pipe setup failed: %s\n",
+                    strerror(errno));
+        }
     }
 
     /* setup hot-plug */
@@ -1331,56 +1303,25 @@ cmd_monitor(int argc, char *argv[])
     if (state.hotplug_fd >= 0) {
         state.evt_hotplug.type = EVT_HOTPLUG;
         state.evt_hotplug.fd = state.hotplug_fd;
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data.ptr = &state.evt_hotplug
-        };
-        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.hotplug_fd, &ev);
     }
 
-    /* setup periodic reconcile timer */
-    state.reconcile_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
-    if (state.reconcile_fd >= 0) {
-        struct itimerspec its;
-        memset(&its, 0, sizeof(its));
-        its.it_value.tv_sec = RECONCILE_INTERVAL_SEC;
-        its.it_interval.tv_sec = RECONCILE_INTERVAL_SEC;
-        timerfd_settime(state.reconcile_fd, 0, &its, NULL);
-
-        state.evt_reconcile.type = EVT_RECONCILE;
-        state.evt_reconcile.fd = state.reconcile_fd;
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data.ptr = &state.evt_reconcile
-        };
-        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.reconcile_fd, &ev);
-    }
+    /* arm the periodic reconcile deadline (poll() timeout drives it) */
+    clock_gettime(CLOCK_MONOTONIC, &state.reconcile_deadline);
+    state.reconcile_deadline.tv_sec += RECONCILE_INTERVAL_SEC;
 
     /* setup control socket */
     state.control_fd = control_init(CONTROL_SOCK_PATH);
     if (state.control_fd >= 0) {
         state.evt_control.type = EVT_CONTROL;
         state.evt_control.fd = state.control_fd;
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data.ptr = &state.evt_control
-        };
-        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.control_fd, &ev);
     }
 
-    /* start the identify worker. Created after sigprocmask() so the worker
-     * thread (and any probe subprocess it forks) inherits the blocked
-     * signal mask -- signals are handled only via signalfd on this thread.
-     * The eventfd becomes readable when resolved identities are pending. */
+    /* start the identify worker. Its self-pipe becomes readable when
+     * resolved identities are pending. */
     state.iw = iw_start(&state.identify_fd);
     if (state.iw != NULL && state.identify_fd >= 0) {
         state.evt_identify.type = EVT_IDENTIFY_DONE;
         state.evt_identify.fd = state.identify_fd;
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data.ptr = &state.evt_identify
-        };
-        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.identify_fd, &ev);
     } else {
         fprintf(stderr, "monitor: identify worker failed to start; "
                         "ambiguous boards keep generic labels\n");
@@ -1418,35 +1359,100 @@ cmd_monitor(int argc, char *argv[])
         printf("PTY devices: %s/*\n", PTY_DIR);
 
     /* ---- main event loop ---- */
-    struct epoll_event events[MAX_EPOLL_EVENTS];
+    struct pollfd pfds[MAX_POLL_FDS];
+    event_ctx_t  *pctx[MAX_POLL_FDS];
     char read_buf[READ_BUF_SIZE];
 
     while (state.running) {
-        /* Use short timeout only when a partial line needs flushing;
-         * otherwise block indefinitely to avoid wasting CPU. */
-        int timeout_ms = -1;
+        int npfd = 0;
+        struct timespec now;
+        long recon_ms;
+        int timeout_ms;
+        int stop;
+
+        /* ---- build the poll set fresh each iteration ---- */
+        if (state.signal_fd >= 0) {
+            pfds[npfd].fd = state.signal_fd;
+            pfds[npfd].events = POLLIN;
+            pctx[npfd] = &state.evt_signal;
+            npfd++;
+        }
+        if (state.hotplug_fd >= 0) {
+            pfds[npfd].fd = state.hotplug_fd;
+            pfds[npfd].events = POLLIN;
+            pctx[npfd] = &state.evt_hotplug;
+            npfd++;
+        }
+        if (state.control_fd >= 0) {
+            pfds[npfd].fd = state.control_fd;
+            pfds[npfd].events = POLLIN;
+            pctx[npfd] = &state.evt_control;
+            npfd++;
+        }
+        if (state.identify_fd >= 0) {
+            pfds[npfd].fd = state.identify_fd;
+            pfds[npfd].events = POLLIN;
+            pctx[npfd] = &state.evt_identify;
+            npfd++;
+        }
+        for (int i = 0; i < state.port_count && npfd < MAX_POLL_FDS - 1;
+             i++) {
+            monitored_port_t *mp = &state.ports[i];
+            if (mp->serial.fd >= 0 && !mp->yielded) {
+                mp->evt.type = EVT_SERIAL;
+                mp->evt.index = i;
+                mp->evt.fd = mp->serial.fd;
+                pfds[npfd].fd = mp->serial.fd;
+                pfds[npfd].events = POLLIN;
+                pctx[npfd] = &mp->evt;
+                npfd++;
+            }
+            if (mp->serial.pty_master >= 0) {
+                mp->evt_pty.type = EVT_PTY;
+                mp->evt_pty.index = i;
+                mp->evt_pty.fd = mp->serial.pty_master;
+                pfds[npfd].fd = mp->serial.pty_master;
+                pfds[npfd].events = POLLIN;
+                pctx[npfd] = &mp->evt_pty;
+                npfd++;
+            }
+        }
+
+        /* ---- timeout: min of reconcile deadline and 200ms line flush ---- */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        recon_ms = (state.reconcile_deadline.tv_sec - now.tv_sec) * 1000L +
+                   (state.reconcile_deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        if (recon_ms < 0)
+            recon_ms = 0;
+        timeout_ms = (int)recon_ms;
         for (int i = 0; i < state.port_count; i++) {
             if (state.ports[i].log.linebuf_len > 0) {
-                timeout_ms = 200;
+                if (timeout_ms > 200)
+                    timeout_ms = 200;
                 break;
             }
         }
-        int nfds = epoll_wait(state.epoll_fd, events,
-                              MAX_EPOLL_EVENTS, timeout_ms);
 
-        if (nfds < 0) {
+        int nready = poll(pfds, (nfds_t)npfd, timeout_ms);
+
+        if (nready < 0) {
             if (errno == EINTR)
-                continue;
-            /* Transient epoll errors must not kill the daemon. Log and
+                continue; /* signal delivered; drain via pipe next loop */
+            /* Transient poll errors must not kill the daemon. Log and
              * retry after a short back-off to avoid a tight error loop. */
-            fprintf(stderr, "monitor: epoll_wait: %s (continuing)\n",
+            fprintf(stderr, "monitor: poll: %s (continuing)\n",
                     strerror(errno));
             usleep(100000); /* 100ms */
             continue;
         }
 
-        for (int i = 0; i < nfds; i++) {
-            event_ctx_t *ctx = events[i].data.ptr;
+        stop = 0;
+        for (int i = 0; i < npfd && !stop; i++) {
+            event_ctx_t *ctx;
+
+            if (pfds[i].revents == 0)
+                continue;
+            ctx = pctx[i];
             if (!ctx)
                 continue;
 
@@ -1456,43 +1462,27 @@ cmd_monitor(int argc, char *argv[])
                 break;
 
             case EVT_HOTPLUG:
+                /* add/relabel/remove may shift ports[] and invalidate the
+                 * rest of this batch's ctx pointers -- stop after it. */
                 handle_hotplug(&state);
+                stop = 1;
                 break;
-
-            case EVT_RECONCILE: {
-                /* drain the timerfd, then re-check device identities */
-                uint64_t expirations;
-                ssize_t tr = read(state.reconcile_fd, &expirations,
-                                  sizeof(expirations));
-                (void)tr;
-                reconcile_ports(&state);
-                /* reconcile may remove/relabel ports, shifting the array
-                 * and invalidating the rest of this batch's event pointers
-                 * -- stop processing further events this iteration. */
-                i = nfds;
-                break;
-            }
 
             case EVT_IDENTIFY_DONE:
-                /* worker resolved one or more board labels; apply them.
-                 * relabel shifts ports[] and invalidates the rest of this
-                 * batch's event pointers -- stop processing this iteration. */
+                /* relabel shifts ports[] -- stop after applying. */
                 handle_identify_done(&state);
-                i = nfds;
+                stop = 1;
                 break;
 
             case EVT_CONTROL: {
-                /* accept new control client */
-                int cfd = accept4(state.control_fd, NULL, NULL,
-                                  SOCK_CLOEXEC);
-                if (cfd >= 0)
+                /* accept new control client (portable: accept + fcntl) */
+                int cfd = accept(state.control_fd, NULL, NULL);
+                if (cfd >= 0) {
+                    set_nonblock_cloexec(cfd);
                     handle_control_cmd(&state, cfd);
+                }
                 break;
             }
-
-            case EVT_CONTROL_CLIENT:
-                /* handled inline at accept time */
-                break;
 
             case EVT_SERIAL: {
                 int idx = ctx->index;
@@ -1526,14 +1516,15 @@ cmd_monitor(int argc, char *argv[])
                 } else if (nr == 0 ||
                            (nr < 0 && errno != EAGAIN &&
                             errno != EWOULDBLOCK)) {
-                    /* port disconnected or error */
+                    /* port disconnected or error (also reached via
+                     * POLLHUP/POLLERR, which make read return 0 / error) */
                     fprintf(stderr, "monitor: read %s: %s\n",
                             mp->identity.dev_path,
                             nr == 0 ? "EOF" : strerror(errno));
                     remove_port(&state, idx);
                     write_status_json(&state);
-                    /* adjust loop since we shifted ports */
-                    i = nfds; /* break out of event loop iteration */
+                    /* ports[] shifted -- stop processing this batch */
+                    stop = 1;
                 }
                 break;
             }
@@ -1573,6 +1564,16 @@ cmd_monitor(int argc, char *argv[])
             }
         }
 
+        /* periodic reconcile once the deadline passes */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > state.reconcile_deadline.tv_sec ||
+            (now.tv_sec == state.reconcile_deadline.tv_sec &&
+             now.tv_nsec >= state.reconcile_deadline.tv_nsec)) {
+            reconcile_ports(&state);
+            clock_gettime(CLOCK_MONOTONIC, &state.reconcile_deadline);
+            state.reconcile_deadline.tv_sec += RECONCILE_INTERVAL_SEC;
+        }
+
         /* flush partial lines older than 200ms */
         flush_stale_lines(&state);
     }
@@ -1597,12 +1598,12 @@ cmd_monitor(int argc, char *argv[])
     if (state.hotplug_fd >= 0)
         hotplug_close(state.hotplug_fd);
     control_close(state.control_fd, CONTROL_SOCK_PATH);
-    if (state.reconcile_fd >= 0)
-        close(state.reconcile_fd);
     if (state.signal_fd >= 0)
         close(state.signal_fd);
-    if (state.epoll_fd >= 0)
-        close(state.epoll_fd);
+    if (g_signal_pipe_w >= 0) {
+        close(g_signal_pipe_w);
+        g_signal_pipe_w = -1;
+    }
 
     pidfile_remove();
     unlink(STATUS_FILE);

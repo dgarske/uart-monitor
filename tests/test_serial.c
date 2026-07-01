@@ -21,7 +21,11 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>

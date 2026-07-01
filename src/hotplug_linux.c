@@ -1,4 +1,4 @@
-/* hotplug.c
+/* hotplug_linux.c
  *
  * Copyright (C) 2025 wolfSSL Inc.
  *

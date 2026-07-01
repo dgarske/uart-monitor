@@ -22,11 +22,11 @@
 #include "util.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -54,9 +54,12 @@ struct identify_worker {
     pthread_t       thread;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
-    int             event_fd;     /* readable when results pending */
+    pthread_cond_t  done_cond;    /* signaled when the thread exits */
+    int             pipe_r;       /* self-pipe read end (main loop polls) */
+    int             pipe_w;       /* self-pipe write end (worker writes) */
     int             running;      /* cleared by iw_stop to end the thread */
     int             started;      /* thread was successfully created */
+    int             finished;     /* thread has returned from its main loop */
 
     iw_job_t          jobs[IW_QUEUE_MAX];
     int               job_count;
@@ -79,9 +82,9 @@ iw_push_result(identify_worker_t *iw, const char *dev_path,
     }
     pthread_mutex_unlock(&iw->lock);
 
-    /* level-triggered wake; value is irrelevant, presence is the signal */
-    uint64_t one = 1;
-    ssize_t wr = write(iw->event_fd, &one, sizeof(one));
+    /* wake the main loop: one byte per result, presence is the signal */
+    unsigned char one = 1;
+    ssize_t wr = write(iw->pipe_w, &one, sizeof(one));
     (void)wr;
 }
 
@@ -138,6 +141,13 @@ iw_thread_main(void *arg)
         }
     }
 
+    /* announce exit so iw_stop() can bound its wait portably (no
+     * pthread_timedjoin_np, which does not exist on macOS). */
+    pthread_mutex_lock(&iw->lock);
+    iw->finished = 1;
+    pthread_cond_broadcast(&iw->done_cond);
+    pthread_mutex_unlock(&iw->lock);
+
     return NULL;
 }
 
@@ -153,36 +163,65 @@ iw_start(int *event_fd_out)
     if (iw == NULL)
         return NULL;
 
-    iw->event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (iw->event_fd < 0) {
-        free(iw);
-        return NULL;
+    iw->pipe_r = -1;
+    iw->pipe_w = -1;
+
+    {
+        int fds[2];
+        if (pipe(fds) < 0) {
+            free(iw);
+            return NULL;
+        }
+        /* nonblocking + cloexec, portable (no eventfd / pipe2). */
+        if (fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0 ||
+            fcntl(fds[0], F_SETFD, FD_CLOEXEC) < 0 ||
+            fcntl(fds[1], F_SETFL, O_NONBLOCK) < 0 ||
+            fcntl(fds[1], F_SETFD, FD_CLOEXEC) < 0) {
+            close(fds[0]);
+            close(fds[1]);
+            free(iw);
+            return NULL;
+        }
+        iw->pipe_r = fds[0];
+        iw->pipe_w = fds[1];
     }
 
     if (pthread_mutex_init(&iw->lock, NULL) != 0) {
-        close(iw->event_fd);
+        close(iw->pipe_r);
+        close(iw->pipe_w);
         free(iw);
         return NULL;
     }
     if (pthread_cond_init(&iw->cond, NULL) != 0) {
         pthread_mutex_destroy(&iw->lock);
-        close(iw->event_fd);
+        close(iw->pipe_r);
+        close(iw->pipe_w);
+        free(iw);
+        return NULL;
+    }
+    if (pthread_cond_init(&iw->done_cond, NULL) != 0) {
+        pthread_cond_destroy(&iw->cond);
+        pthread_mutex_destroy(&iw->lock);
+        close(iw->pipe_r);
+        close(iw->pipe_w);
         free(iw);
         return NULL;
     }
 
     iw->running = 1;
     if (pthread_create(&iw->thread, NULL, iw_thread_main, iw) != 0) {
+        pthread_cond_destroy(&iw->done_cond);
         pthread_cond_destroy(&iw->cond);
         pthread_mutex_destroy(&iw->lock);
-        close(iw->event_fd);
+        close(iw->pipe_r);
+        close(iw->pipe_w);
         free(iw);
         return NULL;
     }
     iw->started = 1;
 
     if (event_fd_out != NULL)
-        *event_fd_out = iw->event_fd;
+        *event_fd_out = iw->pipe_r;
     return iw;
 }
 
@@ -221,7 +260,7 @@ iw_drain(identify_worker_t *iw, identify_result_t *out, int max)
 {
     int n;
     int remaining;
-    uint64_t drained;
+    unsigned char drainbuf[256];
     ssize_t rd;
 
     if (iw == NULL || out == NULL || max <= 0)
@@ -243,14 +282,15 @@ iw_drain(identify_worker_t *iw, identify_result_t *out, int max)
         remaining = 0;
     }
 
-    /* clear the eventfd, then re-arm if results are still queued so the
-     * level-triggered epoll fires again. Done under the lock so a worker
-     * push cannot slip between the clear and the re-arm. */
-    rd = read(iw->event_fd, &drained, sizeof(drained));
+    /* drain all pending wake bytes, then re-arm one if results are still
+     * queued so the level-triggered poll() fires again. Done under the
+     * lock so a worker push cannot slip between the drain and the re-arm. */
+    while ((rd = read(iw->pipe_r, drainbuf, sizeof(drainbuf))) > 0)
+        ;
     (void)rd;
     if (remaining > 0) {
-        uint64_t one = 1;
-        ssize_t wr = write(iw->event_fd, &one, sizeof(one));
+        unsigned char one = 1;
+        ssize_t wr = write(iw->pipe_w, &one, sizeof(one));
         (void)wr;
     }
 
@@ -270,21 +310,40 @@ iw_stop(identify_worker_t *iw)
     pthread_mutex_unlock(&iw->lock);
 
     if (iw->started) {
+        /* Bound the wait portably: wait on done_cond (signaled when the
+         * thread exits) up to the timeout. pthread_timedjoin_np does not
+         * exist on macOS. */
         struct timespec deadline;
+        int finished;
+
         clock_gettime(CLOCK_REALTIME, &deadline);
         deadline.tv_sec += IW_STOP_JOIN_TIMEOUT_SEC;
-        if (pthread_timedjoin_np(iw->thread, NULL, &deadline) != 0) {
+
+        pthread_mutex_lock(&iw->lock);
+        while (!iw->finished) {
+            if (pthread_cond_timedwait(&iw->done_cond, &iw->lock,
+                                       &deadline) != 0)
+                break; /* timed out (or error) */
+        }
+        finished = iw->finished;
+        pthread_mutex_unlock(&iw->lock);
+
+        if (!finished) {
             /* worker is wedged in a probe subprocess. The process is on its
              * way out, so detach and leak the handle rather than block
              * shutdown or risk freeing state the thread still touches. */
             pthread_detach(iw->thread);
             return;
         }
+        pthread_join(iw->thread, NULL);
     }
 
+    pthread_cond_destroy(&iw->done_cond);
     pthread_cond_destroy(&iw->cond);
     pthread_mutex_destroy(&iw->lock);
-    if (iw->event_fd >= 0)
-        close(iw->event_fd);
+    if (iw->pipe_r >= 0)
+        close(iw->pipe_r);
+    if (iw->pipe_w >= 0)
+        close(iw->pipe_w);
     free(iw);
 }

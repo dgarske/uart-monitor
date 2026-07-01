@@ -51,7 +51,7 @@ usage(const char *prog)
         "  --only <devs>       Only monitor these devices (comma-separated)\n"
         "\n"
         "Identify options:\n"
-        "  -v, --verbose       Show full sysfs/udev details\n"
+        "  -v, --verbose       Show full USB device details\n"
         "  --save              Save config to ~/.boards\n"
         "\n"
         "Log files:  /tmp/uart-monitor/latest/<LABEL>.log\n"

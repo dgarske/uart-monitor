@@ -35,6 +35,11 @@ int sysfs_read_hex(const char *path, uint16_t *val);
 /* Safe string copy with guaranteed NUL termination. */
 void strlcpy_safe(char *dst, const char *src, size_t sz);
 
+/* Set O_NONBLOCK and FD_CLOEXEC on fd. Portable replacement for the
+ * Linux-only SOCK_NONBLOCK / SOCK_CLOEXEC socket() flags and accept4(),
+ * neither of which exist on macOS. Returns 0 on success, -1 on error. */
+int set_nonblock_cloexec(int fd);
+
 /* Get timestamp string "YYYY-MM-DD HH:MM:SS.mmm" into buf.
  * buf must be at least 24 bytes. */
 void timestamp_now(char *buf, size_t bufsz);

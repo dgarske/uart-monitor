@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent for uart-monitor (macOS analogue of the systemd user
+  service). Installed to ~/Library/LaunchAgents/ by "make install", which
+  substitutes __UART_MONITOR_BIN__ with the real binary path (launchd does
+  not expand ~ or environment variables in ProgramArguments).
+
+  Load:   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wolfssl.uart-monitor.plist
+  Unload: launchctl bootout   gui/$(id -u) ~/Library/LaunchAgents/com.wolfssl.uart-monitor.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wolfssl.uart-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UART_MONITOR_BIN__</string>
+        <string>monitor</string>
+        <string>--proxy</string>
+    </array>
+
+    <!-- start at login and keep it running (launchd has no sd_notify;
+         readiness is implicit, so the --systemd notify mode is unused). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/uart-monitor/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/uart-monitor/daemon.log</string>
+</dict>
+</plist>

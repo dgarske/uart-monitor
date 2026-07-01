@@ -19,13 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 #include "identify.h"
+#include "platform.h"
 #include "log.h"
 #include "util.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <glob.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -542,41 +542,11 @@ probe_stm32_programmer(const char *serial, char *board_out, size_t board_sz)
     return -1;
 }
 
-/* Extract the USB bus path (e.g. "1-6.2") from a sysfs device path.
- * Looks for pattern /usbN/<path>/ in the resolved sysfs path. */
-static void
-extract_usb_path(const char *sysfs_path, char *usb_path, size_t sz)
-{
-    usb_path[0] = '\0';
-    /* Find /usbN/ in the path, then grab the next path component */
-    const char *p = sysfs_path;
-    while ((p = strstr(p, "/usb")) != NULL) {
-        p += 4; /* skip "/usb" */
-        /* skip the bus number digit(s) */
-        while (*p >= '0' && *p <= '9') p++;
-        if (*p == '/') {
-            p++;
-            /* now p points to the USB device path like "1-6.2/..." */
-            const char *end = p;
-            /* USB path is digits, dashes, dots until next slash or colon */
-            while (*end && *end != '/' && *end != ':')
-                end++;
-            size_t len = (size_t)(end - p);
-            if (len > 0 && len < sz) {
-                memcpy(usb_path, p, len);
-                usb_path[len] = '\0';
-            }
-            return;
-        }
-        /* keep searching */
-    }
-}
-
-/* Core sysfs identification shared by identify_port_cheap() and
+/* Core device identification shared by identify_port_cheap() and
  * identify_port(): fills vid/pid/serial/product/known and the
- * product-string board match. Runs NO external probe and sets no
- * label, so it touches none of the probe-cache statics and is safe to
- * call from the daemon's main thread. */
+ * product-string board match via the platform USB backend. Runs NO
+ * external probe and sets no label, so it touches none of the probe-cache
+ * statics and is safe to call from the daemon's main thread. */
 static int
 identify_port_core(const char *dev_path, tty_port_t *port)
 {
@@ -588,74 +558,11 @@ identify_port_core(const char *dev_path, tty_port_t *port)
     strlcpy_safe(port->tty_name, slash ? slash + 1 : dev_path,
                  sizeof(port->tty_name));
 
-    /* resolve /sys/class/tty/<name>/device
-     * Use PATH_MAX-sized buffers since sysfs paths can be very long. */
-    char syslink[512];
-    char resolved[PATH_MAX];
-    snprintf(syslink, sizeof(syslink),
-             "/sys/class/tty/%s/device", port->tty_name);
-
-    if (realpath(syslink, resolved) == NULL) {
-        /* no sysfs entry -- might be a virtual tty */
+    /* read vid/pid/serial/manufacturer/product/interface_num/usb_path
+     * from the platform USB backend (sysfs on Linux, IOKit on macOS).
+     * A failure means the device has no USB backing (gone / virtual). */
+    if (plat_read_usb_info(port) != 0)
         return -1;
-    }
-
-    /* Walk up the directory tree looking for USB device properties.
-     * For ttyUSB: resolved = .../1-6.2:1.0/ttyUSB0/ttyUSB0
-     *   interface dir has bInterfaceNumber
-     *   USB device dir (parent of interface) has idVendor
-     * For ttyACM: resolved = .../1-5.3:1.2
-     *   this IS the interface dir */
-    char path[PATH_MAX];
-    strlcpy_safe(path, resolved, sizeof(path));
-    int found_iface = 0;
-
-    /* Helper to build sysfs attribute paths safely.
-     * attr_buf must be PATH_MAX + 32 to guarantee no truncation. */
-    #define SYSFS_ATTR_BUFSZ (PATH_MAX + 32)
-    char attr[SYSFS_ATTR_BUFSZ];
-    char val[128];
-
-    for (int depth = 0; depth < 12; depth++) {
-        /* Check for bInterfaceNumber (interface directory) */
-        if (!found_iface) {
-            snprintf(attr, sizeof(attr), "%s/bInterfaceNumber", path);
-            if (sysfs_read_attr(attr, val, sizeof(val)) >= 0) {
-                port->interface_num = (int)strtol(val, NULL, 10);
-                found_iface = 1;
-            }
-        }
-
-        /* Check for idVendor (USB device directory) */
-        snprintf(attr, sizeof(attr), "%s/idVendor", path);
-        if (sysfs_read_attr(attr, val, sizeof(val)) >= 0) {
-            /* Found the USB device directory */
-            sysfs_read_hex(attr, &port->vid);
-
-            snprintf(attr, sizeof(attr), "%s/idProduct", path);
-            sysfs_read_hex(attr, &port->pid);
-
-            snprintf(attr, sizeof(attr), "%s/serial", path);
-            sysfs_read_attr(attr, port->serial, sizeof(port->serial));
-
-            snprintf(attr, sizeof(attr), "%s/manufacturer", path);
-            sysfs_read_attr(attr, port->manufacturer,
-                           sizeof(port->manufacturer));
-
-            snprintf(attr, sizeof(attr), "%s/product", path);
-            sysfs_read_attr(attr, port->product, sizeof(port->product));
-
-            /* Extract USB path from this sysfs path */
-            extract_usb_path(path, port->usb_path, sizeof(port->usb_path));
-            break;
-        }
-
-        /* go up one directory */
-        char *sl = strrchr(path, '/');
-        if (!sl || sl == path)
-            break;
-        *sl = '\0';
-    }
 
     /* fallback names */
     if (port->manufacturer[0] == '\0')
@@ -751,55 +658,9 @@ identify_port(const char *dev_path, tty_port_t *port)
 }
 
 int
-read_port_serial(const char *dev_path, char *out, size_t out_sz)
-{
-    const char *slash;
-    char tty_name[32];
-    char syslink[512];
-    char resolved[PATH_MAX];
-    char path[PATH_MAX];
-    char attr[PATH_MAX + 32];
-    char val[128];
-    char *sl;
-    int depth;
-
-    if (out == NULL || out_sz == 0)
-        return -1;
-    out[0] = '\0';
-
-    slash = strrchr(dev_path, '/');
-    strlcpy_safe(tty_name, slash != NULL ? slash + 1 : dev_path,
-                 sizeof(tty_name));
-
-    snprintf(syslink, sizeof(syslink),
-             "/sys/class/tty/%s/device", tty_name);
-    if (realpath(syslink, resolved) == NULL)
-        return -1; /* no sysfs entry -- device gone */
-
-    /* Walk up to the USB device directory (the one with idVendor) and
-     * read its serial. This is the cheap prefix of identify_port() with
-     * no SWD / STM32_Programmer_CLI probe, so it is safe to call often. */
-    strlcpy_safe(path, resolved, sizeof(path));
-    for (depth = 0; depth < 12; depth++) {
-        snprintf(attr, sizeof(attr), "%s/idVendor", path);
-        if (sysfs_read_attr(attr, val, sizeof(val)) >= 0) {
-            snprintf(attr, sizeof(attr), "%s/serial", path);
-            sysfs_read_attr(attr, out, out_sz);
-            return 0; /* serial may legitimately be empty */
-        }
-        sl = strrchr(path, '/');
-        if (sl == NULL || sl == path)
-            break;
-        *sl = '\0';
-    }
-    return 0;
-}
-
-int
 scan_all_ports(tty_port_t *ports, int max_ports)
 {
     glob_t g;
-    int flags = 0;
     int n = 0;
 
     memset(&g, 0, sizeof(g));
@@ -807,10 +668,7 @@ scan_all_ports(tty_port_t *ports, int max_ports)
     /* Reset per-scan probe cache so stale hotplug state doesn't leak. */
     stlink_probe_cache_reset();
 
-    glob("/dev/ttyUSB*",  flags, NULL, &g);
-    flags |= GLOB_APPEND;
-    glob("/dev/ttyACM*",  flags, NULL, &g);
-    glob("/dev/ttyUART*", flags, NULL, &g);
+    plat_glob_serial_ports(&g);
 
     for (size_t i = 0; i < g.gl_pathc && n < max_ports; i++) {
         if (identify_port(g.gl_pathv[i], &ports[n]) == 0)
@@ -830,15 +688,11 @@ int
 scan_all_ports_cheap(tty_port_t *ports, int max_ports)
 {
     glob_t g;
-    int flags = 0;
     int n = 0;
 
     memset(&g, 0, sizeof(g));
 
-    glob("/dev/ttyUSB*",  flags, NULL, &g);
-    flags |= GLOB_APPEND;
-    glob("/dev/ttyACM*",  flags, NULL, &g);
-    glob("/dev/ttyUART*", flags, NULL, &g);
+    plat_glob_serial_ports(&g);
 
     for (size_t i = 0; i < g.gl_pathc && n < max_ports; i++) {
         if (identify_port_cheap(g.gl_pathv[i], &ports[n]) == 0)
@@ -1090,10 +944,11 @@ load_board_config(board_id_t *ids, int max_ids)
             }
         }
 
-        /* look for: LABEL=/dev/ttyUSBN  (device path assignment, no S/N) */
+        /* look for: LABEL=/dev/ttyUSBN or LABEL=/dev/cu.usbserial-XX
+         * (device path assignment, no S/N) */
         if (current_board[0] && trimmed[0] != '#' && trimmed[0] != '\n') {
             char *eq = strchr(trimmed, '=');
-            if (eq && strncmp(eq + 1, "/dev/tty", 8) == 0) {
+            if (eq && strncmp(eq + 1, "/dev/", 5) == 0) {
                 /* extract device path (strip trailing comment/whitespace) */
                 char *devp = eq + 1;
                 char dev[256];

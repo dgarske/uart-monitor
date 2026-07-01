@@ -28,13 +28,15 @@ typedef enum {
 
 typedef struct {
     hotplug_action_t action;
-    char devname[64];       /* e.g. "ttyUSB0" */
+    char devname[64];       /* e.g. "ttyUSB0" or "cu.usbserial-AL00KKC6" */
     char devpath[256];      /* e.g. "/dev/ttyUSB0" */
 } hotplug_event_t;
 
-/* Initialize hotplug detection.
- * Tries netlink KOBJECT_UEVENT first, falls back to inotify on /dev/.
- * Returns the fd to add to epoll, or -1 on error. */
+/* Initialize hotplug detection. Returns a readable fd for the main poll()
+ * loop, or -1 on error. Linux (hotplug_linux.c) tries netlink
+ * KOBJECT_UEVENT first, falling back to inotify on /dev/. macOS
+ * (hotplug_macos.c) runs an IOKit notification thread and returns the read
+ * end of a self-pipe that becomes readable when events are queued. */
 int hotplug_init(void);
 
 /* Read and parse a hotplug event from the fd.

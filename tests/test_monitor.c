@@ -20,7 +20,11 @@
  */
 #include <assert.h>
 #include <errno.h>
+#ifdef __APPLE__
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,9 +59,14 @@ test_log_create_session(void)
         return;
     }
 
-    /* check that latest symlink exists */
+    /* check that latest symlink exists under the active base dir (the
+     * suite redirects logging via UART_MONITOR_DIR, so use that, not the
+     * hardcoded LOG_BASE_DIR which only exists when a daemon is running). */
+    const char *base = getenv("UART_MONITOR_DIR");
+    if (base == NULL || base[0] == '\0')
+        base = LOG_BASE_DIR;
     char latest[512];
-    snprintf(latest, sizeof(latest), "%s/latest", LOG_BASE_DIR);
+    snprintf(latest, sizeof(latest), "%s/latest", base);
     char target[512];
     ssize_t n = readlink(latest, target, sizeof(target) - 1);
     if (n < 0) {
@@ -84,6 +93,7 @@ test_log_write_timestamps(void)
         FAIL("log_open failed");
         return;
     }
+    lf.timestamps = 1; /* exercise the timestamp-prefix path */
 
     /* write some data */
     log_write(&lf, "Hello world\n", 12);
@@ -160,12 +170,11 @@ test_log_crlf_handling(void)
     if (!fp) { FAIL("cannot read log"); return; }
 
     char line[512];
-    int linecount = 0;
     int found_line1 = 0;
     int found_line2 = 0;
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "line1")) { found_line1 = 1; linecount++; }
-        if (strstr(line, "line2")) { found_line2 = 1; linecount++; }
+        if (strstr(line, "line1")) found_line1 = 1;
+        if (strstr(line, "line2")) found_line2 = 1;
     }
     fclose(fp);
 

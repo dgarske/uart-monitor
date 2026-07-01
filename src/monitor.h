@@ -26,22 +26,20 @@
 #include "serial.h"
 #include "log.h"
 
-/* Event source types for epoll dispatch */
+/* Event source types for poll() dispatch */
 typedef enum {
     EVT_SIGNAL,
     EVT_SERIAL,
     EVT_PTY,             /* data from PTY slave (user writing to proxy) */
     EVT_HOTPLUG,
     EVT_CONTROL,
-    EVT_CONTROL_CLIENT,
-    EVT_RECONCILE,       /* periodic timerfd: re-check device identities */
-    EVT_IDENTIFY_DONE,   /* worker eventfd: resolved identities pending */
+    EVT_IDENTIFY_DONE,   /* worker self-pipe: resolved identities pending */
 } event_type_t;
 
 typedef struct {
     event_type_t type;
     int          index;     /* for EVT_SERIAL/EVT_PTY: index into ports[] */
-    int          fd;        /* for EVT_CONTROL_CLIENT */
+    int          fd;
 } event_ctx_t;
 
 /* State for a single monitored port */
@@ -57,12 +55,10 @@ typedef struct {
 
 /* Overall daemon state */
 typedef struct {
-    int              epoll_fd;
-    int              signal_fd;
+    int              signal_fd;       /* signal self-pipe read end */
     int              hotplug_fd;
     int              control_fd;
-    int              reconcile_fd;    /* timerfd for periodic re-identify */
-    int              identify_fd;     /* worker eventfd (results pending) */
+    int              identify_fd;     /* worker self-pipe (results pending) */
     identify_worker_t *iw;            /* background identification worker */
     char             session_path[512];
     monitored_port_t ports[MAX_PORTS];
@@ -70,8 +66,8 @@ typedef struct {
     event_ctx_t      evt_signal;
     event_ctx_t      evt_hotplug;
     event_ctx_t      evt_control;
-    event_ctx_t      evt_reconcile;
     event_ctx_t      evt_identify;
+    struct timespec  reconcile_deadline; /* next periodic reconcile time */
     volatile int     running;
     int              systemd_mode;
     int              proxy_mode;      /* --proxy: PTY proxy for shared access */
