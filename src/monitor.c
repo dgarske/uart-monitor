@@ -1295,6 +1295,11 @@ cmd_monitor(int argc, char *argv[])
 
     int foreground = 0;
 
+    /* Under systemd stdout is a pipe, so glibc block-buffers it and
+     * runtime event lines (removals, reconciles, PTY excl heals) sit in
+     * the buffer instead of reaching the journal. Line-buffer it. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     /* Ignore SIGPIPE: a closed PTY slave or disconnected control socket
      * must not kill the daemon. write() returns -1/EPIPE instead. */
     signal(SIGPIPE, SIG_IGN);
