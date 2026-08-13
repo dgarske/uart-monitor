@@ -34,6 +34,7 @@ typedef enum {
     EVT_HOTPLUG,
     EVT_CONTROL,
     EVT_IDENTIFY_DONE,   /* worker self-pipe: resolved identities pending */
+    EVT_PTY_WATCH,       /* inotify: PTY slave closed by a client (Linux) */
 } event_type_t;
 
 typedef struct {
@@ -49,6 +50,7 @@ typedef struct {
     log_file_t   log;
     event_ctx_t  evt;         /* epoll context for serial fd */
     event_ctx_t  evt_pty;     /* epoll context for PTY master fd */
+    int          pty_watch_wd; /* inotify watch on pty_path (-1 if none) */
     int          yielded;
     size_t       bytes_read;
 } monitored_port_t;
@@ -59,6 +61,8 @@ typedef struct {
     int              hotplug_fd;
     int              control_fd;
     int              identify_fd;     /* worker self-pipe (results pending) */
+    int              inotify_fd;      /* PTY slave close watches (Linux; -1
+                                       * elsewhere or on init failure) */
     identify_worker_t *iw;            /* background identification worker */
     char             session_path[512];
     monitored_port_t ports[MAX_PORTS];
@@ -67,6 +71,7 @@ typedef struct {
     event_ctx_t      evt_hotplug;
     event_ctx_t      evt_control;
     event_ctx_t      evt_identify;
+    event_ctx_t      evt_inotify;
     struct timespec  reconcile_deadline; /* next periodic reconcile time */
     volatile int     running;
     int              systemd_mode;

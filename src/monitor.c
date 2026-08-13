@@ -37,6 +37,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef __APPLE__
+#include <sys/inotify.h>
+#endif
+
 /* poll() set size: each port contributes a serial fd and (in proxy mode)
  * a PTY master, plus a handful of fixed sources (signal / hot-plug /
  * control / identify). */
@@ -340,6 +344,7 @@ add_port(monitor_state_t *state, tty_port_t *identity)
     mp->identity = *identity;
     mp->serial.fd = -1;
     mp->serial.pty_master = -1;
+    mp->pty_watch_wd = -1;
 
     /* open serial port (proxy or read-only) */
     speed_t baud = (identity->baud > 0)
@@ -408,6 +413,21 @@ add_port(monitor_state_t *state, tty_port_t *identity)
 
         /* create PTY symlink */
         pty_create_symlink(identity->label, mp->serial.pty_path);
+
+#ifndef __APPLE__
+        /* Watch the slave node so a client's exit (close) lets us clear
+         * any TIOCEXCL it left behind; see handle_pty_watch(). */
+        if (state->inotify_fd >= 0) {
+            mp->pty_watch_wd = inotify_add_watch(state->inotify_fd,
+                mp->serial.pty_path, IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
+            if (mp->pty_watch_wd < 0) {
+                fprintf(stderr, "monitor: inotify watch %s [%s]: %s "
+                        "(excl heal falls back to reconcile)\n",
+                        mp->serial.pty_path, identity->label,
+                        strerror(errno));
+            }
+        }
+#endif
     }
 
     state->port_count++;
@@ -435,6 +455,15 @@ remove_port(monitor_state_t *state, int idx)
 
     if (mp->serial.pty_master >= 0)
         pty_remove_symlink(mp->identity.label);
+
+#ifndef __APPLE__
+    if (mp->pty_watch_wd >= 0 && state->inotify_fd >= 0) {
+        /* EINVAL if the kernel already auto-removed it (IN_IGNORED) --
+         * harmless, ignore. */
+        (void)inotify_rm_watch(state->inotify_fd, mp->pty_watch_wd);
+        mp->pty_watch_wd = -1;
+    }
+#endif
 
     log_marker(&mp->log, "PORT DISCONNECTED");
     log_close(&mp->log);
@@ -1038,6 +1067,18 @@ reconcile_ports(monitor_state_t *state)
         if (mp->yielded)
             continue;
 
+        /* Heal a PTY slave left exclusive by an exiting client. On Linux
+         * the inotify close-watch does this instantly; this pass covers
+         * macOS (no inotify/TIOCGEXCL) and any port whose watch add
+         * failed. Degraded-mode tradeoff: this can drop exclusivity out
+         * from under a still-attached client, which beats a permanently
+         * EBUSY pty. */
+        if (mp->serial.pty_master >= 0 && mp->pty_watch_wd < 0) {
+            if (serial_pty_clear_excl(&mp->serial) > 0)
+                printf("  Reconcile: cleared PTY excl on [%s]\n",
+                       mp->identity.label);
+        }
+
         rc = read_port_serial(mp->identity.dev_path, serial, sizeof(serial));
         if (rc < 0) {
             /* node vanished without a remove event -- drop it */
@@ -1085,6 +1126,61 @@ handle_identify_done(monitor_state_t *state)
     if (changed)
         write_status_json(state);
 }
+
+#ifndef __APPLE__
+/* A client closed a proxied PTY slave. If it left TIOCEXCL set (screen
+ * does), the pty pair never dies -- the daemon holds the master and a
+ * keeper slave fd -- so the kernel never clears exclusivity and every
+ * later open() gets EBUSY. Clear it via the keeper fd now that the
+ * client is gone. */
+static void
+handle_pty_watch(monitor_state_t *state)
+{
+    char buf[4096];
+    ssize_t n;
+
+    while ((n = read(state->inotify_fd, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off + (ssize_t)sizeof(struct inotify_event) <= n) {
+            const struct inotify_event *ie =
+                (const struct inotify_event *)(buf + off);
+            int i;
+
+            if (ie->mask & IN_Q_OVERFLOW) {
+                /* lost events: sweep every proxied port */
+                for (i = 0; i < state->port_count; i++) {
+                    if (serial_pty_clear_excl(
+                            &state->ports[i].serial) > 0)
+                        printf("  PTY excl cleared: [%s]\n",
+                               state->ports[i].identity.label);
+                }
+            }
+            else {
+                /* map wd -> port: linear search; the wd lives in the
+                 * port struct so ports[] compaction cannot desync it */
+                for (i = 0; i < state->port_count; i++) {
+                    monitored_port_t *mp = &state->ports[i];
+                    if (mp->pty_watch_wd != ie->wd)
+                        continue;
+                    if (ie->mask & IN_IGNORED) {
+                        mp->pty_watch_wd = -1; /* watch auto-removed */
+                    }
+                    else if (ie->mask &
+                             (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)) {
+                        if (serial_pty_clear_excl(&mp->serial) > 0)
+                            printf("  PTY excl cleared: [%s]\n",
+                                   mp->identity.label);
+                    }
+                    break;
+                }
+            }
+            off += (ssize_t)(sizeof(struct inotify_event) + ie->len);
+        }
+    }
+    /* n < 0 with EAGAIN ends the drain; other errors are transient
+     * and retried on the next poll wakeup */
+}
+#endif /* !__APPLE__ */
 
 /* ------------------------------------------------------------------ */
 /*  Hot-plug handling                                                  */
@@ -1194,6 +1290,7 @@ cmd_monitor(int argc, char *argv[])
     state.hotplug_fd = -1;
     state.control_fd = -1;
     state.identify_fd = -1;
+    state.inotify_fd = -1;
     state.iw = NULL;
 
     int foreground = 0;
@@ -1305,6 +1402,23 @@ cmd_monitor(int argc, char *argv[])
         state.evt_hotplug.fd = state.hotplug_fd;
     }
 
+#ifndef __APPLE__
+    /* inotify instance for PTY slave close-heal (proxy mode). Must be
+     * set up before the add_port loop below so startup ports get
+     * watches. */
+    if (state.proxy_mode) {
+        state.inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (state.inotify_fd >= 0) {
+            state.evt_inotify.type = EVT_PTY_WATCH;
+            state.evt_inotify.fd = state.inotify_fd;
+        } else {
+            fprintf(stderr, "monitor: inotify init: %s "
+                    "(PTY excl heal via reconcile only)\n",
+                    strerror(errno));
+        }
+    }
+#endif
+
     /* arm the periodic reconcile deadline (poll() timeout drives it) */
     clock_gettime(CLOCK_MONOTONIC, &state.reconcile_deadline);
     state.reconcile_deadline.tv_sec += RECONCILE_INTERVAL_SEC;
@@ -1395,6 +1509,12 @@ cmd_monitor(int argc, char *argv[])
             pctx[npfd] = &state.evt_identify;
             npfd++;
         }
+        if (state.inotify_fd >= 0) {
+            pfds[npfd].fd = state.inotify_fd;
+            pfds[npfd].events = POLLIN;
+            pctx[npfd] = &state.evt_inotify;
+            npfd++;
+        }
         for (int i = 0; i < state.port_count && npfd < MAX_POLL_FDS - 1;
              i++) {
             monitored_port_t *mp = &state.ports[i];
@@ -1472,6 +1592,13 @@ cmd_monitor(int argc, char *argv[])
                 /* relabel shifts ports[] -- stop after applying. */
                 handle_identify_done(&state);
                 stop = 1;
+                break;
+
+            case EVT_PTY_WATCH:
+#ifndef __APPLE__
+                /* never shifts ports[], no stop needed */
+                handle_pty_watch(&state);
+#endif
                 break;
 
             case EVT_CONTROL: {
@@ -1597,6 +1724,8 @@ cmd_monitor(int argc, char *argv[])
 
     if (state.hotplug_fd >= 0)
         hotplug_close(state.hotplug_fd);
+    if (state.inotify_fd >= 0)
+        close(state.inotify_fd); /* frees all remaining watches */
     control_close(state.control_fd, CONTROL_SOCK_PATH);
     if (state.signal_fd >= 0)
         close(state.signal_fd);

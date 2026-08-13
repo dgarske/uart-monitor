@@ -50,6 +50,15 @@ int serial_open_proxy(serial_port_t *sp, const char *dev_path, speed_t baud);
  * Safe to call on already-closed port. */
 void serial_close(serial_port_t *sp);
 
+/* Clear a stale exclusive-access lock (TIOCEXCL) left on the PTY slave
+ * by an exiting client (e.g. screen). The daemon holds the pty pair open
+ * forever (master + keeper slave), so the kernel never clears the lock
+ * on the client's last close and every later open() fails EBUSY.
+ * Uses the held keeper pty_slave fd.
+ * Returns 1 if an exclusive lock was present and cleared, 0 if there was
+ * nothing to clear (or no PTY), -1 on ioctl error. */
+int serial_pty_clear_excl(serial_port_t *sp);
+
 /* Map a numeric baud rate (e.g. 115200) to a speed_t constant. */
 speed_t baud_to_speed(int baud);
 

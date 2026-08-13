@@ -28,8 +28,14 @@
 #endif
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <unistd.h>
+
+#ifndef __APPLE__
+#include <poll.h>
+#include <sys/inotify.h>
+#endif
 
 #include "../src/serial.h"
 #include "../src/util.h"
@@ -365,6 +371,202 @@ test_proxy_bidirectional(void)
     PASS();
 }
 
+/* Regression: a client (screen) that sets TIOCEXCL on the proxy PTY
+ * slave and exits must not leave the pty permanently EBUSY. The daemon
+ * holds the pty pair open forever, so the kernel never clears the lock
+ * on the client's last close; serial_pty_clear_excl() must heal it. */
+static void
+test_pty_excl_heal(void)
+{
+    TEST("stale TIOCEXCL heal on PTY slave");
+    int master;
+    char slave_path[256];
+    if (create_pty_pair(&master, slave_path, sizeof(slave_path)) < 0) {
+        FAIL("cannot create PTY pair");
+        return;
+    }
+
+    serial_port_t sp;
+    if (serial_open_proxy(&sp, slave_path, B115200) < 0) {
+        FAIL("serial_open_proxy failed");
+        close(master);
+        return;
+    }
+
+    /* client attaches, sets exclusive mode (screen does), exits */
+    int client = open(sp.pty_path, O_RDWR | O_NOCTTY);
+    if (client < 0) {
+        FAIL("cannot open PTY slave as client");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+    if (ioctl(client, TIOCEXCL) < 0) {
+        FAIL("TIOCEXCL failed");
+        close(client);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+    close(client);
+
+    /* the bug: reconnect fails EBUSY (Linux kernel contract; BSD ptys
+     * may behave differently, tolerate either there) */
+    int reopen = open(sp.pty_path, O_RDWR | O_NOCTTY);
+#ifndef __APPLE__
+    if (reopen >= 0 || errno != EBUSY) {
+        FAIL("expected EBUSY reopen after client TIOCEXCL");
+        if (reopen >= 0)
+            close(reopen);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+#else
+    if (reopen >= 0)
+        close(reopen);
+#endif
+
+    /* the fix: clear via the keeper slave fd */
+    int rc = serial_pty_clear_excl(&sp);
+#ifndef __APPLE__
+    if (rc != 1) {
+        FAIL("serial_pty_clear_excl did not report a clear");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+#else
+    if (rc < 0) {
+        FAIL("serial_pty_clear_excl failed");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+#endif
+
+    reopen = open(sp.pty_path, O_RDWR | O_NOCTTY);
+    if (reopen < 0) {
+        FAIL("reopen still fails after heal");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    close(reopen);
+    serial_close(&sp);
+    close(master);
+    PASS();
+}
+
+#ifndef __APPLE__
+/* Kernel-contract guard for the monitor wiring: inotify on a /dev/pts/N
+ * node must deliver a close event when a client exits, so the daemon can
+ * clear a stale TIOCEXCL the moment it happens. */
+static void
+test_pty_close_inotify(void)
+{
+    TEST("inotify close event on PTY slave");
+    int master;
+    char slave_path[256];
+    if (create_pty_pair(&master, slave_path, sizeof(slave_path)) < 0) {
+        FAIL("cannot create PTY pair");
+        return;
+    }
+
+    serial_port_t sp;
+    if (serial_open_proxy(&sp, slave_path, B115200) < 0) {
+        FAIL("serial_open_proxy failed");
+        close(master);
+        return;
+    }
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (ifd < 0) {
+        FAIL("inotify_init1 failed");
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+    int wd = inotify_add_watch(ifd, sp.pty_path,
+                               IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
+    if (wd < 0) {
+        FAIL("inotify_add_watch failed");
+        close(ifd);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    /* client attach, TIOCEXCL, exit -- must produce a close event */
+    int client = open(sp.pty_path, O_RDWR | O_NOCTTY);
+    if (client < 0 || ioctl(client, TIOCEXCL) < 0) {
+        FAIL("client open/TIOCEXCL failed");
+        if (client >= 0)
+            close(client);
+        close(ifd);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+    close(client);
+
+    struct pollfd pfd;
+    pfd.fd = ifd;
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, 1000) <= 0) {
+        FAIL("no inotify event within 1s");
+        close(ifd);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    char buf[4096];
+    ssize_t n = read(ifd, buf, sizeof(buf));
+    int got_close = 0;
+    ssize_t off = 0;
+    while (off + (ssize_t)sizeof(struct inotify_event) <= n) {
+        const struct inotify_event *ie =
+            (const struct inotify_event *)(buf + off);
+        if (ie->wd == wd &&
+            (ie->mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)))
+            got_close = 1;
+        off += (ssize_t)(sizeof(struct inotify_event) + ie->len);
+    }
+    if (!got_close) {
+        FAIL("no close event for watched pty");
+        close(ifd);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    /* end-to-end: what the daemon's handler does on that event */
+    if (serial_pty_clear_excl(&sp) != 1) {
+        FAIL("clear after event did not report a clear");
+        close(ifd);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+    int reopen = open(sp.pty_path, O_RDWR | O_NOCTTY);
+    if (reopen < 0) {
+        FAIL("reopen after event-driven heal failed");
+        close(ifd);
+        serial_close(&sp);
+        close(master);
+        return;
+    }
+
+    close(reopen);
+    close(ifd);
+    serial_close(&sp);
+    close(master);
+    PASS();
+}
+#endif /* !__APPLE__ */
+
 int main(void)
 {
     printf("=== test_serial ===\n");
@@ -375,6 +577,10 @@ int main(void)
     test_double_close();
     test_proxy_open_close();
     test_proxy_bidirectional();
+    test_pty_excl_heal();
+#ifndef __APPLE__
+    test_pty_close_inotify();
+#endif
 
     printf("\n  Results: %d passed, %d failed\n\n",
            tests_passed, tests_failed);

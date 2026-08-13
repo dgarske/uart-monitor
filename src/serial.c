@@ -165,6 +165,31 @@ serial_close(serial_port_t *sp)
     sp->pty_path[0] = '\0';
 }
 
+int
+serial_pty_clear_excl(serial_port_t *sp)
+{
+    if (sp == NULL || sp->pty_slave < 0)
+        return 0;
+#ifdef TIOCGEXCL
+    {
+        int excl = 0;
+        if (ioctl(sp->pty_slave, TIOCGEXCL, &excl) < 0)
+            return -1;
+        if (excl == 0)
+            return 0;
+        if (ioctl(sp->pty_slave, TIOCNXCL) < 0)
+            return -1;
+        return 1;
+    }
+#else
+    /* No TIOCGEXCL (macOS): clear unconditionally; we cannot tell
+     * whether a lock was actually present, so report 0. */
+    if (ioctl(sp->pty_slave, TIOCNXCL) < 0)
+        return -1;
+    return 0;
+#endif
+}
+
 speed_t
 baud_to_speed(int baud)
 {
