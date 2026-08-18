@@ -40,7 +40,11 @@ typedef struct {
     char usb_path[128];
     const known_device_t *known;
     const char *function_name;
-    const char *board_override;
+    /* Owned copy of the ~/.boards board name. This must NOT be a
+     * pointer: every caller of apply_board_config() passes a stack-local
+     * board_id_t array, and the populated tty_port_t is then copied into
+     * daemon-lifetime state, so a pointer into that array would dangle. */
+    char board_override[128];
     const char *board_match;   /* from USB product string match */
     char label[64];      /* filesystem-safe name, e.g. "VMK180_UART1" */
     int  baud;           /* per-device baud rate override (0 = use global) */

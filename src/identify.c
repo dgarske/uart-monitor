@@ -744,7 +744,7 @@ get_device_label(tty_port_t *port)
      * single-UART board (e.g. NUCLEO-H563ZI) would produce
      * "NUCLEO_H563ZI_UART0", not the "NUCLEO_H563ZI_UART" the probe path
      * produces, breaking label continuity across a probe failure. */
-    if (port->board_override && port->board_override[0]) {
+    if (port->board_override[0]) {
         char board[48];
         strlcpy_safe(board, port->board_override, sizeof(board));
         sanitize_label(board);
@@ -1017,9 +1017,10 @@ apply_board_config(tty_port_t *ports, int nports,
                         }
                     }
                     if (!compat)
-                        continue;   /* stale path – skip */
+                        continue;   /* stale path -- skip */
                 }
-                ports[i].board_override = ids[j].board_name;
+                strlcpy_safe(ports[i].board_override, ids[j].board_name,
+                             sizeof(ports[i].board_override));
                 if (ids[j].baud > 0)
                     ports[i].baud = ids[j].baud;
                 /* regenerate label with the board override */
@@ -1061,7 +1062,7 @@ print_port_table(device_group_t *groups, int ngroups, int verbose)
 
         /* possible boards */
         printf("  Possible Board: ");
-        if (first->board_override) {
+        if (first->board_override[0]) {
             printf("%s", first->board_override);
         } else if (first->board_match) {
             printf("%s", first->board_match);

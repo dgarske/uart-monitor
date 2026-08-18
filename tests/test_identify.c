@@ -94,7 +94,8 @@ test_get_device_label_override(void)
     strlcpy_safe(port.tty_name, "ttyUSB4", sizeof(port.tty_name));
     port.known = lookup_known_device(0x10c4, 0xea71);
     port.interface_num = 0;
-    port.board_override = "ZynqMP ZCU102";
+    strlcpy_safe(port.board_override, "ZynqMP ZCU102",
+                 sizeof(port.board_override));
 
     get_device_label(&port);
 
@@ -181,8 +182,8 @@ test_apply_board_config_path_mismatch(void)
 
     apply_board_config(ports, 1, ids, 1);
 
-    if (ports[0].board_override != NULL) {
-        printf("\n    got override: '%s', expected NULL\n    ",
+    if (ports[0].board_override[0] != '\0') {
+        printf("\n    got override: '%s', expected none\n    ",
                ports[0].board_override);
         FAIL("should not apply mismatched board override");
         return;
@@ -206,7 +207,7 @@ test_apply_board_config_serial_match(void)
     strlcpy_safe(ports[0].tty_name, "ttyACM0", sizeof(ports[0].tty_name));
     ports[0].interface_num = 1;
 
-    /* Config matches by serial — should override even if board doesn't match */
+    /* Config matches by serial -- should override even if board differs */
     board_id_t ids[1];
     memset(ids, 0, sizeof(ids));
     strlcpy_safe(ids[0].serial, "EQAQBQLQ", sizeof(ids[0].serial));
@@ -214,9 +215,48 @@ test_apply_board_config_serial_match(void)
 
     apply_board_config(ports, 1, ids, 1);
 
-    if (ports[0].board_override == NULL ||
-        strcmp(ports[0].board_override, "CustomBoard") != 0) {
+    if (strcmp(ports[0].board_override, "CustomBoard") != 0) {
         FAIL("serial match should allow any board override");
+        return;
+    }
+    PASS();
+}
+
+/* apply_board_config() must COPY the board name, not alias it. Every
+ * daemon caller passes a stack-local board_id_t array and then copies the
+ * populated tty_port_t into long-lived state, so an aliasing pointer would
+ * dangle for the life of the daemon. Overwriting the config array here
+ * while it is still in scope makes the check fully defined: it fails on an
+ * aliasing implementation without relying on stack reuse. */
+static void
+test_apply_board_config_owns_name(void)
+{
+    TEST("apply_board_config copies the board name");
+    tty_port_t port;
+    board_id_t ids[1];
+
+    memset(&port, 0, sizeof(port));
+    port.vid = 0x1fc9;
+    port.pid = 0x0090;
+    port.known = lookup_known_device(0x1fc9, 0x0090);
+    strlcpy_safe(port.serial, "EQAQBQLQ", sizeof(port.serial));
+    strlcpy_safe(port.dev_path, "/dev/ttyACM0", sizeof(port.dev_path));
+    strlcpy_safe(port.tty_name, "ttyACM0", sizeof(port.tty_name));
+    port.interface_num = 1;
+
+    memset(ids, 0, sizeof(ids));
+    strlcpy_safe(ids[0].serial, "EQAQBQLQ", sizeof(ids[0].serial));
+    strlcpy_safe(ids[0].board_name, "CustomBoard", sizeof(ids[0].board_name));
+
+    apply_board_config(&port, 1, ids, 1);
+
+    /* the caller's config array goes away */
+    memset(ids, 0xAA, sizeof(ids));
+
+    if (strcmp(port.board_override, "CustomBoard") != 0) {
+        printf("\n    got: '%s' expected: 'CustomBoard'\n    ",
+               port.board_override);
+        FAIL("board name not copied -- aliases caller storage");
         return;
     }
     PASS();
@@ -279,6 +319,7 @@ int main(void)
     test_get_device_label_fallback();
     test_apply_board_config_path_mismatch();
     test_apply_board_config_serial_match();
+    test_apply_board_config_owns_name();
     test_group_ports();
 
     printf("\n  Results: %d passed, %d failed\n\n",
