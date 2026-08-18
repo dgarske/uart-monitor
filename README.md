@@ -101,12 +101,23 @@ make install
 # Enable auto-start at login (make install prints these commands)
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wolfssl.uart-monitor.plist
 
-# Stop / disable
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.wolfssl.uart-monitor.plist
+# Check status (state, pid, and the binary path launchd will exec)
+launchctl print gui/$(id -u)/com.wolfssl.uart-monitor
 
 # Daemon logs (launchd has no journal; stdout/stderr go here)
 tail -f /tmp/uart-monitor/daemon.log
+
+# Restart -- launchd has no "restart" verb; kickstart -k is the equivalent
+# of "systemctl --user restart". Without -k it only starts a stopped job.
+launchctl kickstart -k gui/$(id -u)/com.wolfssl.uart-monitor
+
+# Stop / disable
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.wolfssl.uart-monitor.plist
 ```
+
+Upgrading on macOS takes two steps: `make install` replaces the binary on disk, but the running agent keeps executing the old image until you restart it. `KeepAlive` restarts the job if it exits, so a plain `kill` also works, but it races the relaunch -- prefer `kickstart -k`.
+
+Use `bootout` + `bootstrap` only when the plist itself changed (launchd caches the job definition, so `kickstart` will not pick up an edited plist).
 
 ## Usage
 
@@ -429,7 +440,7 @@ For a deterministic, probe-independent override, pin the board by USB serial in 
 # USB: 1-1.2.1 | S/N: 000D001E4D4B500C20373831
 ```
 
-Serial matches are authoritative (they bypass the VID:PID compatibility check), apply on every hot-plug, and survive a daemon restart. Apply with `systemctl --user restart uart-monitor`.
+Serial matches are authoritative (they bypass the VID:PID compatibility check), apply on every hot-plug, and survive a daemon restart. Apply with `systemctl --user restart uart-monitor` on Linux, or `launchctl kickstart -k gui/$(id -u)/com.wolfssl.uart-monitor` on macOS. A `SIGHUP` rescan (`systemctl --user reload uart-monitor`) re-reads `~/.boards`, but only applies it to ports that are not already being monitored -- changing the pin on a port the daemon already holds needs a full restart.
 
 ## Future TODO
 
