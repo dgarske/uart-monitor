@@ -4,3 +4,6 @@ tests/test_serial
 tests/test_monitor
 tests/test_identify
 *.o
+
+# macOS debug bundles from -g / sanitizer builds
+*.dSYM/
