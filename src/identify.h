@@ -106,6 +106,10 @@ int group_ports(tty_port_t *ports, int nports,
 /* Generate a filesystem-safe label for a port's log directory. */
 void get_device_label(tty_port_t *port);
 
+/* Human-readable board name: ~/.boards pin, else product/probe match,
+ * else the USB device's first known board, else "Unknown". Never NULL. */
+const char *get_board_name(const tty_port_t *port);
+
 /* Print formatted table of ports grouped by device. */
 void print_port_table(device_group_t *groups, int ngroups, int verbose);
 

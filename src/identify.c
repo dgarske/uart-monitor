@@ -734,6 +734,23 @@ append_sn_suffix(char *suffix, size_t sz, const char *serial)
     snprintf(suffix, sz, "_%s", tail);
 }
 
+/* Human-readable board name for a port, most specific source first: a
+ * ~/.boards pin, then a USB-product-string or probe match, then the first
+ * board listed for the USB device. Callers that report a board name must
+ * use this rather than open-coding the chain -- status.json and the log
+ * header previously each had their own and disagreed. */
+const char *
+get_board_name(const tty_port_t *port)
+{
+    if (port->board_override[0])
+        return port->board_override;
+    if (port->board_match)
+        return port->board_match;
+    if (port->known && port->known->boards[0])
+        return port->known->boards[0];
+    return "Unknown";
+}
+
 void
 get_device_label(tty_port_t *port)
 {

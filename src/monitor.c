@@ -204,11 +204,7 @@ write_status_json(monitor_state_t *state)
 
     for (int i = 0; i < state->port_count; i++) {
         monitored_port_t *mp = &state->ports[i];
-        const char *board = "Unknown";
-        if (mp->identity.board_override[0])
-            board = mp->identity.board_override;
-        else if (mp->identity.known && mp->identity.known->boards[0])
-            board = mp->identity.known->boards[0];
+        const char *board = get_board_name(&mp->identity);
 
         const char *func = mp->identity.function_name ?
                            mp->identity.function_name : "Unknown";
@@ -264,13 +260,7 @@ write_status_json(monitor_state_t *state)
             continue; /* already in "ports" array */
 
         tty_port_t *p = &all_ports[i];
-        const char *board = "Unknown";
-        if (p->board_override[0])
-            board = p->board_override;
-        else if (p->board_match)
-            board = p->board_match;
-        else if (p->known && p->known->boards[0])
-            board = p->known->boards[0];
+        const char *board = get_board_name(p);
 
         const char *func = p->function_name ? p->function_name : "Unknown";
 
@@ -363,11 +353,7 @@ add_port(monitor_state_t *state, tty_port_t *identity)
     /* Sized for the worst case the format can produce: dev_path[256] +
      * label[64] + board_override[128] plus the fixed text and numbers. */
     char header[1024];
-    const char *board = "Unknown";
-    if (identity->board_override[0])
-        board = identity->board_override;
-    else if (identity->known && identity->known->boards[0])
-        board = identity->known->boards[0];
+    const char *board = get_board_name(identity);
 
     snprintf(header, sizeof(header),
              "Device: %s (%s)\n"
@@ -899,11 +885,7 @@ relabel_port_inplace(monitor_state_t *state, int idx, tty_port_t *fresh)
      * identity struct and are deliberately left untouched. */
     mp->identity = *fresh;
 
-    board = "Unknown";
-    if (fresh->board_override[0])
-        board = fresh->board_override;
-    else if (fresh->known && fresh->known->boards[0])
-        board = fresh->known->boards[0];
+    board = get_board_name(fresh);
 
     snprintf(header, sizeof(header),
              "Device: %s (%s)\n"

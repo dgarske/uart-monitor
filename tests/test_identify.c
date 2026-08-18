@@ -262,6 +262,54 @@ test_apply_board_config_owns_name(void)
     PASS();
 }
 
+/* get_board_name() is the single source of truth for the reported board
+ * name. status.json and the log header used to open-code the chain and
+ * disagreed: the monitored-ports loop skipped board_match, so a device
+ * resolved by USB product string reported its USB device's first known
+ * board instead (SCU35 logged as "VMK180"). */
+static void
+test_get_board_name_precedence(void)
+{
+    TEST("get_board_name precedence chain");
+    tty_port_t port;
+
+    /* no information at all */
+    memset(&port, 0, sizeof(port));
+    if (strcmp(get_board_name(&port), "Unknown") != 0) {
+        FAIL("bare port should be Unknown");
+        return;
+    }
+
+    /* known device only -> its first listed board */
+    port.known = lookup_known_device(0x0403, 0x6011);
+    if (strcmp(get_board_name(&port), port.known->boards[0]) != 0) {
+        FAIL("known device should fall back to boards[0]");
+        return;
+    }
+
+    /* product-string match beats the known device's board list */
+    port.board_match = lookup_board_by_product("SCU35");
+    if (port.board_match == NULL) {
+        FAIL("lookup_board_by_product(SCU35) returned NULL");
+        return;
+    }
+    if (strcmp(get_board_name(&port), port.board_match) != 0) {
+        printf("\n    got: '%s' expected: '%s'\n    ",
+               get_board_name(&port), port.board_match);
+        FAIL("board_match should outrank known->boards[0]");
+        return;
+    }
+
+    /* a ~/.boards pin outranks everything */
+    strlcpy_safe(port.board_override, "PinnedBoard",
+                 sizeof(port.board_override));
+    if (strcmp(get_board_name(&port), "PinnedBoard") != 0) {
+        FAIL("board_override should outrank board_match");
+        return;
+    }
+    PASS();
+}
+
 static void
 test_group_ports(void)
 {
@@ -320,6 +368,7 @@ int main(void)
     test_apply_board_config_path_mismatch();
     test_apply_board_config_serial_match();
     test_apply_board_config_owns_name();
+    test_get_board_name_precedence();
     test_group_ports();
 
     printf("\n  Results: %d passed, %d failed\n\n",
