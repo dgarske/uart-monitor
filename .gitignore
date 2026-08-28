@@ -7,3 +7,6 @@ tests/test_identify
 
 # macOS debug bundles from -g / sanitizer builds
 *.dSYM/
+
+# generated header dependencies (-MMD)
+*.d

@@ -966,6 +966,20 @@ apply_identify_result(monitor_state_t *state, const identify_result_t *r)
     if (nbids > 0)
         apply_board_config(&fresh, 1, bids, nbids);
 
+    /* get_device_label() always writes a non-empty label -- every branch
+     * emits at least "_UART", and the last one falls back to the tty name.
+     * An empty label here therefore means the result was corrupted in
+     * transit rather than legitimately resolved, and adopting it is
+     * destructive: every affected port collapses onto a single
+     * "<session>/.log" and its PTY symlink becomes the pty directory
+     * itself. Keep the label we already have and let the next probe retry. */
+    if (fresh.label[0] == '\0') {
+        fprintf(stderr,
+                "monitor: %s: identify returned an empty label, keeping [%s]\n",
+                r->dev_path, state->ports[idx].identity.label);
+        return 0;
+    }
+
     if (strcmp(state->ports[idx].identity.label, fresh.label) == 0)
         return 0; /* probe did not change the label (still generic) */
 

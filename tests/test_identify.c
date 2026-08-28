@@ -267,6 +267,51 @@ test_apply_board_config_owns_name(void)
  * disagreed: the monitored-ports loop skipped board_match, so a device
  * resolved by USB product string reported its USB device's first known
  * board instead (SCU35 logged as "VMK180"). */
+/* get_device_label() must never leave the label empty. An empty label is
+ * destructive downstream: the log path becomes "<session>/.log" and the PTY
+ * symlink becomes the pty directory itself, so every affected port shares
+ * one file. Every branch emits at least "_UART" and the last falls back to
+ * the tty name -- pin that so the invariant monitor.c's relabel guard
+ * relies on cannot regress. */
+static void
+test_get_device_label_never_empty(void)
+{
+    TEST("get_device_label never empty");
+    tty_port_t port;
+
+    /* no board information at all: tty_name fallback */
+    memset(&port, 0, sizeof(port));
+    strlcpy_safe(port.dev_path, "/dev/ttyACM9", sizeof(port.dev_path));
+    strlcpy_safe(port.tty_name, "ttyACM9", sizeof(port.tty_name));
+    get_device_label(&port);
+    if (port.label[0] == '\0') {
+        FAIL("bare port produced an empty label");
+        return;
+    }
+
+    /* a ~/.boards name that sanitizes away to nothing must still label */
+    memset(&port, 0, sizeof(port));
+    strlcpy_safe(port.tty_name, "ttyACM9", sizeof(port.tty_name));
+    strlcpy_safe(port.board_override, "---", sizeof(port.board_override));
+    get_device_label(&port);
+    if (port.label[0] == '\0') {
+        FAIL("board_override produced an empty label");
+        return;
+    }
+
+    /* resolved by probe / product string */
+    memset(&port, 0, sizeof(port));
+    strlcpy_safe(port.tty_name, "ttyACM9", sizeof(port.tty_name));
+    port.board_match = "NUCLEO-V873XJ";
+    get_device_label(&port);
+    if (strcmp(port.label, "NUCLEO_V873XJ_UART") != 0) {
+        FAIL("board_match label mismatch");
+        return;
+    }
+
+    PASS();
+}
+
 static void
 test_get_board_name_precedence(void)
 {
@@ -369,6 +414,7 @@ int main(void)
     test_apply_board_config_serial_match();
     test_apply_board_config_owns_name();
     test_get_board_name_precedence();
+    test_get_device_label_never_empty();
     test_group_ports();
 
     printf("\n  Results: %d passed, %d failed\n\n",

@@ -19,7 +19,7 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
 
 CC      ?= gcc
-CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -pthread
+CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -pthread -MMD -MP
 LDFLAGS = -pthread
 PREFIX  ?= $(HOME)/.local
 
@@ -65,7 +65,7 @@ $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 clean:
-	rm -rf $(BUILDDIR) $(TARGET)
+	rm -rf $(BUILDDIR) $(TARGET) $(addsuffix .d,$(TESTS))
 
 LAUNCHD_LABEL = com.wolfssl.uart-monitor
 LAUNCHD_DIR   = $(HOME)/Library/LaunchAgents
@@ -126,3 +126,15 @@ test: $(TARGET) $(TESTS)
 	@echo "=== All tests passed ==="
 
 .PHONY: all clean install uninstall test
+
+# Header dependency tracking. Without this, editing a header leaves stale
+# objects in build/ that were compiled against the old declarations, and the
+# link silently produces a binary whose translation units disagree. That is
+# not hypothetical: growing tty_port_t.board_override from a pointer to a
+# 128-byte array shifted `label`, but identify_worker.o was never rebuilt, so
+# the worker wrote the label at the old offset and the main thread read zeros
+# -- every probe result relabeled its port to "". -MMD emits a .d per object
+# as a side effect of the normal compile; -MP adds phony targets so deleting
+# a header does not break the build.
+DEPS = $(OBJS:.o=.d) $(addsuffix .d,$(TESTS))
+-include $(DEPS)
