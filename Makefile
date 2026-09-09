@@ -93,6 +93,25 @@ else
 	@echo "Enable with: systemctl --user enable --now uart-monitor"
 endif
 
+# Install the Claude Code skill. The repo copy under .claude/skills is the
+# canonical one; this copies it to the user-wide location so both stay in
+# step. Kept separate from `install` so installing the binary never silently
+# overwrites a skill the user has edited.
+SKILL_SRC = .claude/skills/uart-monitor/SKILL.md
+SKILL_DIR = $(HOME)/.claude/skills/uart-monitor
+
+install-skill:
+	install -d $(SKILL_DIR)
+	install -m 644 $(SKILL_SRC) $(SKILL_DIR)/SKILL.md
+	@echo "Installed skill to $(SKILL_DIR)/SKILL.md"
+
+# Fail if the installed skill has drifted from the repo copy.
+check-skill:
+	@diff -u $(SKILL_DIR)/SKILL.md $(SKILL_SRC) >/dev/null 2>&1 \
+	    && echo "skill in sync" \
+	    || { echo "skill DIFFERS from $(SKILL_SRC); run 'make install-skill'"; \
+	         exit 1; }
+
 uninstall:
 	rm -f $(PREFIX)/bin/$(TARGET)
 ifeq ($(UNAME_S),Darwin)
@@ -125,7 +144,7 @@ test: $(TARGET) $(TESTS)
 	@for t in $(TESTS); do echo "--- $$t ---"; ./$$t || exit 1; done
 	@echo "=== All tests passed ==="
 
-.PHONY: all clean install uninstall test
+.PHONY: all clean install uninstall test install-skill check-skill
 
 # Header dependency tracking. Without this, editing a header leaves stale
 # objects in build/ that were compiled against the old declarations, and the
