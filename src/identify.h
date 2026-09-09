@@ -22,6 +22,7 @@
 #define IDENTIFY_H
 
 #include "devices.h"
+#include <stddef.h>
 #include <stdint.h>
 
 #define MAX_PORTS       64
@@ -56,15 +57,26 @@ typedef struct {
     int port_count;
 } device_group_t;
 
-/* Board config entry loaded from ~/.boards */
+/* Board config entry loaded from ~/.boards.
+ *
+ * Three possible match keys, in descending order of trustworthiness:
+ *   serial   - globally unique, survives re-enumeration. Best.
+ *   usb_path - USB topology, e.g. "1-6.1". Stable as long as the cable
+ *              stays in the same hub port. The only stable key available
+ *              for adapters that report no serial (FT4232H strapped with
+ *              SerialNumber=0), whose /dev path floats on every replug.
+ *   dev_path - /dev/ttyUSBn. Volatile; the kernel reuses freed minor
+ *              numbers, so a stale pin can land on an unrelated board.
+ */
 typedef struct {
     char serial[64];
     char board_name[128];
     int  baud;           /* per-board baud rate (0 = use global default) */
+    char usb_path[128];  /* optional: match by USB topology path */
     char dev_path[256];  /* optional: match by device path instead of S/N */
 } board_id_t;
 
-#define MAX_BOARD_IDS 32
+#define MAX_BOARD_IDS 64
 
 /* Scan all /dev/ttyUSB*, ttyACM*, ttyUART* ports. Returns count.
  * Runs the full identify (may shell out to st-info / STM32_Programmer_CLI);
@@ -103,11 +115,29 @@ void identify_reset_probe_caches(void);
 int group_ports(tty_port_t *ports, int nports,
                 device_group_t *groups, int max_groups);
 
+/* Intern a board name into process-lifetime storage and return a pointer
+ * to it. tty_port_t.board_match is a `const char *` that outlives the
+ * caller's stack frame, so every probe-derived name passes through here.
+ * Interning, not appending: calling this repeatedly with the same name
+ * returns the same pointer and consumes no extra space, which is what
+ * keeps a port that re-enumerates every few seconds from exhausting the
+ * arena and dragging every other port's label down with it.
+ * Returns NULL if the arena is full. */
+const char *intern_board_name(const char *name);
+
+/* Bytes of the board-name arena currently in use. Diagnostic: once this
+ * reaches the arena size, further probe results fall back to generic
+ * labels. */
+size_t intern_board_name_used(void);
+
 /* Generate a filesystem-safe label for a port's log directory. */
 void get_device_label(tty_port_t *port);
 
 /* Human-readable board name: ~/.boards pin, else product/probe match,
- * else the USB device's first known board, else "Unknown". Never NULL. */
+ * else the USB device's single known board, else "Unknown". Never NULL.
+ * A device whose VID:PID is shared by several boards reports "Unknown"
+ * rather than naming the first candidate -- a guess presented as fact is
+ * worse than admitting the board is unresolved. */
 const char *get_board_name(const tty_port_t *port);
 
 /* Print formatted table of ports grouped by device. */

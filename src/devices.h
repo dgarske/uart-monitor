@@ -91,10 +91,28 @@ static const known_device_t KNOWN_DEVICES[] = {
       { "USB Relay", "Generic", NULL, NULL } },
     { 0x067b, 0x2303, "Prolific PL2303",   1, 0,
       { "Generic", NULL, NULL, NULL } },
+    { 0x067b, 0x23a3, "Prolific PL2303GC", 1, 0,
+      { "Generic", NULL, NULL, NULL } },
+
+    /* Moxa */
+    { 0x110a, 0x1150, "Moxa UPort 1150", 1, 0,
+      { "Moxa UPort 1150", NULL, NULL, NULL } },
+
+    /* Microchip/Microsemi FlashPro5. Interface 0 is the JTAG programmer
+     * and exposes no tty; interfaces 1-3 are the target UARTs. */
+    { 0x1514, 0x2008, "Microsemi FlashPro5", 4, 0,
+      { "Microchip FlashPro5", NULL, NULL, NULL } },
 
     /* Debuggers */
     { 0x0897, 0x0002, "Lauterbach TRACE32", 1, 0,
       { "Debugger", NULL, NULL, NULL } },
+    /* TI XDS110: two CDC-ACM ports, at interfaces 0 and 3. */
+    { 0x0451, 0xbef3, "TI XDS110", 4, 0,
+      { "TI XDS110", NULL, NULL, NULL } },
+    { 0x1366, 0x0105, "SEGGER J-Link", 1, 0,
+      { "SEGGER J-Link", NULL, NULL, NULL } },
+    { 0x0416, 0x2004, "Nuvoton Nu-Link2", 1, 0,
+      { "Nuvoton Nu-Link2", NULL, NULL, NULL } },
 };
 #define KNOWN_DEVICES_COUNT \
     ((int)(sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0])))
@@ -104,6 +122,10 @@ static const port_function_t PORT_FUNCTIONS[] = {
       { "UART/JTAG Port A", "UART/JTAG Port B", NULL, NULL } },
     { "FTDI FT4232H",
       { "UART0/JTAG", "UART1", "UART2", "UART3" } },
+    { "Microsemi FlashPro5",
+      { "JTAG/Programmer", "UART0", "UART1", "UART2" } },
+    { "TI XDS110",
+      { "Application UART", NULL, NULL, "Auxiliary Data" } },
     { "Cypress FX3",
       { "UART0 (Console)", "UART1 (PMC)", "UART2 (Debug)", "UART3" } },
     { "Silicon Labs CP210x",

@@ -46,8 +46,6 @@
  * control / identify). */
 #define MAX_POLL_FDS      (MAX_PORTS * 2 + 16)
 #define READ_BUF_SIZE     4096
-#define PID_FILE          LOG_BASE_DIR "/uart-monitor.pid"
-#define STATUS_FILE       LOG_BASE_DIR "/status.json"
 
 /* How often the daemon re-checks that the hardware behind each monitored
  * tty node still matches the label it was opened under. Catches a board
@@ -121,7 +119,7 @@ static int
 pidfile_create(void)
 {
     /* check for stale pid file */
-    FILE *fp = fopen(PID_FILE, "r");
+    FILE *fp = fopen(log_pid_file_path(), "r");
     if (fp) {
         int old_pid = 0;
         if (fscanf(fp, "%d", &old_pid) == 1 && old_pid > 0) {
@@ -133,10 +131,10 @@ pidfile_create(void)
             }
         }
         fclose(fp);
-        unlink(PID_FILE);
+        unlink(log_pid_file_path());
     }
 
-    fp = fopen(PID_FILE, "w");
+    fp = fopen(log_pid_file_path(), "w");
     if (!fp)
         return -1;
     fprintf(fp, "%d\n", getpid());
@@ -147,7 +145,7 @@ pidfile_create(void)
 static void
 pidfile_remove(void)
 {
-    unlink(PID_FILE);
+    unlink(log_pid_file_path());
 }
 
 /* ------------------------------------------------------------------ */
@@ -157,10 +155,10 @@ pidfile_remove(void)
 static void
 pty_create_symlink(const char *label, const char *pty_path)
 {
-    mkdirp(PTY_DIR);
+    mkdirp(log_pty_dir_path());
 
     char link[512];
-    snprintf(link, sizeof(link), "%s/%s", PTY_DIR, label);
+    snprintf(link, sizeof(link), "%s/%s", log_pty_dir_path(), label);
     symlink_update(pty_path, link);
 }
 
@@ -168,13 +166,164 @@ static void
 pty_remove_symlink(const char *label)
 {
     char link[512];
-    snprintf(link, sizeof(link), "%s/%s", PTY_DIR, label);
+    snprintf(link, sizeof(link), "%s/%s", log_pty_dir_path(), label);
     unlink(link);
 }
 
 /* forward declarations -- defined further down */
 static int find_port_by_path(monitor_state_t *state, const char *dev_path);
 static int port_needs_probe(const tty_port_t *p);
+static void relabel_port_inplace(monitor_state_t *state, int idx,
+                                 tty_port_t *fresh);
+
+/* ------------------------------------------------------------------ */
+/*  Flap tracking                                                     */
+/*                                                                    */
+/*  A board whose power is off, or behind a failing cable, can        */
+/*  re-enumerate every couple of seconds. Each cycle is a full        */
+/*  remove/add: log markers, PTY teardown and recreation, a fresh     */
+/*  identify probe. Left unchecked that buries every other board's    */
+/*  events in the journal and churns the probe caches.                */
+/*                                                                    */
+/*  Entries are keyed on the hardware identity, NOT on the /dev path: */
+/*  the path is precisely the thing that changes when a device        */
+/*  re-enumerates (the kernel hands out a fresh, and freely recycled, */
+/*  ttyUSB minor each time).                                          */
+/* ------------------------------------------------------------------ */
+
+#define FLAP_TABLE_SZ    32
+#define FLAP_WINDOW_SEC  60   /* transitions are counted over this window */
+#define FLAP_THRESHOLD   4    /* disconnects in the window => flapping */
+#define FLAP_REPORT_SEC  60   /* min gap between "still flapping" lines  */
+
+typedef struct {
+    char   key[200];
+    char   label[64];
+    int    count;          /* disconnects inside the current window */
+    int    total;          /* disconnects since the daemon started */
+    time_t window_start;
+    time_t last_disconnect;
+    time_t last_report;
+    int    flapping;
+} flap_entry_t;
+
+static flap_entry_t flap_table[FLAP_TABLE_SZ];
+static int flap_table_count = 0;
+
+/* Stable identity key for the flap table. A USB serial is unique and
+ * survives re-enumeration; a serial-less device is identified by its hub
+ * port plus interface. The /dev path is the last resort only. */
+static void
+flap_make_key(const tty_port_t *id, char *out, size_t sz)
+{
+    if (id->serial[0])
+        snprintf(out, sz, "sn:%.180s", id->serial);
+    else if (id->usb_path[0])
+        snprintf(out, sz, "usb:%.170s:%d", id->usb_path, id->interface_num);
+    else
+        snprintf(out, sz, "dev:%.180s", id->dev_path);
+}
+
+static flap_entry_t *
+flap_find(const tty_port_t *id, int create)
+{
+    char key[200];
+    int i;
+
+    flap_make_key(id, key, sizeof(key));
+
+    for (i = 0; i < flap_table_count; i++) {
+        if (strcmp(flap_table[i].key, key) == 0)
+            return &flap_table[i];
+    }
+    if (!create)
+        return NULL;
+
+    if (flap_table_count < FLAP_TABLE_SZ) {
+        i = flap_table_count++;
+    } else {
+        /* Full: reuse the entry that has been quiet the longest. */
+        int oldest = 0;
+        for (i = 1; i < flap_table_count; i++) {
+            if (flap_table[i].last_disconnect <
+                flap_table[oldest].last_disconnect)
+                oldest = i;
+        }
+        i = oldest;
+    }
+    memset(&flap_table[i], 0, sizeof(flap_table[i]));
+    strlcpy_safe(flap_table[i].key, key, sizeof(flap_table[i].key));
+    return &flap_table[i];
+}
+
+/* Record a disconnect. Returns 1 if this port should be treated as
+ * flapping (callers use it to quiet routine logging and to skip the
+ * external identify probe until the hardware settles). */
+static int
+flap_record_disconnect(const tty_port_t *id)
+{
+    flap_entry_t *fe = flap_find(id, 1);
+    time_t now = time(NULL);
+
+    if (fe == NULL)
+        return 0;
+
+    strlcpy_safe(fe->label, id->label, sizeof(fe->label));
+    fe->total++;
+    fe->last_disconnect = now;
+
+    if (fe->window_start == 0 || now - fe->window_start > FLAP_WINDOW_SEC) {
+        fe->window_start = now;
+        fe->count = 1;
+        fe->flapping = 0;
+        return 0;
+    }
+
+    fe->count++;
+    if (fe->count >= FLAP_THRESHOLD && !fe->flapping) {
+        fe->flapping = 1;
+        fe->last_report = now;
+        printf("  Flapping: %s [%s] re-enumerated %d times in %lds -- "
+               "quieting per-event logs and deferring identification "
+               "(check power and cabling)\n",
+               id->dev_path, id->label[0] ? id->label : id->tty_name,
+               fe->count, (long)(now - fe->window_start));
+        fflush(stdout);
+    } else if (fe->flapping && now - fe->last_report >= FLAP_REPORT_SEC) {
+        fe->last_report = now;
+        printf("  Flapping: %s [%s] still unstable (%d disconnects "
+               "total)\n", id->dev_path,
+               id->label[0] ? id->label : id->tty_name, fe->total);
+        fflush(stdout);
+    }
+    return fe->flapping;
+}
+
+/* Is this identity currently considered unstable? Also clears the state
+ * once the port has been quiet for a full window, so a board that settles
+ * returns to normal logging and gets probed again. */
+static int
+flap_is_flapping(const tty_port_t *id)
+{
+    flap_entry_t *fe = flap_find(id, 0);
+    time_t now;
+
+    if (fe == NULL || !fe->flapping)
+        return 0;
+
+    now = time(NULL);
+    if (now - fe->last_disconnect > FLAP_WINDOW_SEC) {
+        fe->flapping = 0;
+        fe->count = 0;
+        fe->window_start = 0;
+        printf("  Recovered: %s [%s] stable again after %d disconnects\n",
+               id->dev_path, id->label[0] ? id->label : id->tty_name,
+               fe->total);
+        fflush(stdout);
+        return 0;
+    }
+    return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Status JSON                                                       */
@@ -184,7 +333,7 @@ static void
 write_status_json(monitor_state_t *state)
 {
     char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", STATUS_FILE, getpid());
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", log_status_file_path(), getpid());
 
     FILE *fp = fopen(tmp, "w");
     if (!fp)
@@ -221,11 +370,22 @@ write_status_json(monitor_state_t *state)
         fprintf(fp, "      \"log_file\": \"%s\",\n", mp->log.filepath);
         if (mp->serial.pty_master >= 0) {
             fprintf(fp, "      \"pty_device\": \"%s/%s\",\n",
-                    PTY_DIR, mp->identity.label);
+                    log_pty_dir_path(), mp->identity.label);
             fprintf(fp, "      \"pty_slave\": \"%s\",\n",
                     mp->serial.pty_path);
         }
-        fprintf(fp, "      \"bytes_logged\": %zu\n", mp->log.bytes_written);
+        fprintf(fp, "      \"bytes_logged\": %zu,\n", mp->log.bytes_written);
+        {
+            /* Why is this port dark / noisy? Report re-enumeration
+             * history so `uart-monitor status` answers that directly. */
+            const flap_entry_t *fe = flap_find(&mp->identity, 0);
+            fprintf(fp, "      \"flapping\": %s,\n",
+                    (fe && fe->flapping) ? "true" : "false");
+            fprintf(fp, "      \"disconnect_count\": %d,\n",
+                    fe ? fe->total : 0);
+            fprintf(fp, "      \"last_disconnect\": %ld\n",
+                    fe ? (long)fe->last_disconnect : 0L);
+        }
         fprintf(fp, "    }%s\n",
                 (i < state->port_count - 1) ? "," : "");
     }
@@ -279,7 +439,7 @@ write_status_json(monitor_state_t *state)
     fprintf(fp, "  ]\n}\n");
     fclose(fp);
 
-    rename(tmp, STATUS_FILE);
+    rename(tmp, log_status_file_path());
 }
 
 /* ------------------------------------------------------------------ */
@@ -372,19 +532,14 @@ add_port(monitor_state_t *state, tty_port_t *identity)
     }
     mp->log.timestamps = state->timestamps;
 
-    /* create a tty_name.log -> label.log symlink for compatibility */
-    if (strcmp(identity->tty_name, identity->label) != 0) {
-        char link_path[768];
-        char label_log[128];
-        snprintf(link_path, sizeof(link_path),
-                 "%s/%s.log", state->session_path, identity->tty_name);
-        snprintf(label_log, sizeof(label_log), "%s.log", identity->label);
-        /* only create symlink if it doesn't already exist */
-        if (access(link_path, F_OK) != 0) {
-            int sret = symlink(label_log, link_path);
-            (void)sret;
-        }
-    }
+    /* No <tty_name>.log -> <label>.log alias is created. The tty number
+     * is exactly the identifier that does not survive a re-enumeration:
+     * the alias was never removed on disconnect, so after the kernel
+     * recycled a minor number "ttyUSB0.log" went on pointing at the
+     * previous board's log and `uart-monitor tail ttyUSB0` silently
+     * followed the wrong board. Lookup by tty name still works -- cmd_tail
+     * resolves it through status.json, which maps the live /dev path to
+     * the current label. */
 
     /* tag the serial fd for poll() dispatch. The pollfd set is rebuilt
      * from the ports array each loop iteration, so there is no epoll
@@ -424,7 +579,7 @@ add_port(monitor_state_t *state, tty_port_t *identity)
         printf("  Monitoring: %s [%s] -> %s\n"
                "    PTY proxy: %s/%s -> %s\n",
                identity->dev_path, identity->label, mp->log.filepath,
-               PTY_DIR, identity->label, mp->serial.pty_path);
+               log_pty_dir_path(), identity->label, mp->serial.pty_path);
     } else {
         printf("  Monitoring: %s [%s] -> %s\n",
                identity->dev_path, identity->label, mp->log.filepath);
@@ -457,8 +612,14 @@ remove_port(monitor_state_t *state, int idx)
     log_close(&mp->log);
     serial_close(&mp->serial);
 
-    printf("  Removed: %s [%s]\n",
-           mp->identity.dev_path, mp->identity.label);
+    /* Count the disconnect against this hardware identity. Once a port
+     * is flapping this reports one summary line instead of a pair of
+     * lines per cycle, so a dead board stops burying every other board's
+     * events in the journal. */
+    if (!flap_record_disconnect(&mp->identity)) {
+        printf("  Removed: %s [%s]\n",
+               mp->identity.dev_path, mp->identity.label);
+    }
 
     /* shift remaining ports down; the poll() set is rebuilt next
      * iteration, so only the per-slot dispatch index needs fixing up. */
@@ -653,7 +814,7 @@ handle_control_cmd(monitor_state_t *state, int client_fd)
         /* write fresh status and send it */
         write_status_json(state);
 
-        FILE *fp = fopen(STATUS_FILE, "r");
+        FILE *fp = fopen(log_status_file_path(), "r");
         if (fp) {
             size_t nr = fread(resp, 1, sizeof(resp) - 1, fp);
             resp[nr] = '\0';
@@ -805,6 +966,40 @@ handle_signal(monitor_state_t *state)
                 iw_submit(state->iw, ports[i].dev_path, 0);
         }
 
+        /* Re-apply ~/.boards to ports we are ALREADY monitoring. Without
+         * this, add_port()'s dedup-by-path means an edited pin only ever
+         * reaches ports the daemon does not yet hold, and correcting a
+         * label needs a full restart -- which on a shared bench blacks
+         * out logging for every board, so in practice the pin just never
+         * takes effect.
+         *
+         * Only an explicit ~/.boards override may relabel a live port.
+         * The scan above is the cheap sysfs-only identify, so it carries
+         * no probe result; relabelling on a plain label difference would
+         * happily downgrade a port that STM32_Programmer_CLI had resolved
+         * to "NUCLEO_H563ZI_UART" back to a generic name. An override
+         * outranks a probe anyway, so it can only ever be an improvement.
+         *
+         * relabel_port_inplace() reopens the log file and PTY symlink but
+         * never the USB fd, so this is safe against live ports. */
+        for (int i = 0; i < nports; i++) {
+            int idx;
+
+            if (ports[i].board_override[0] == '\0')
+                continue;
+            if (ports[i].label[0] == '\0')
+                continue;
+
+            idx = find_port_by_path(state, ports[i].dev_path);
+            if (idx < 0 || state->ports[idx].yielded)
+                continue;
+            if (strcmp(state->ports[idx].identity.label,
+                       ports[i].label) == 0)
+                continue;
+
+            relabel_port_inplace(state, idx, &ports[i]);
+        }
+
         write_status_json(state);
         break;
     }
@@ -906,19 +1101,6 @@ relabel_port_inplace(monitor_state_t *state, int idx, tty_port_t *fresh)
     }
     mp->log.timestamps = state->timestamps;
 
-    /* compat symlink tty_name.log -> label.log (mirrors add_port) */
-    if (strcmp(fresh->tty_name, fresh->label) != 0) {
-        char link_path[768];
-        char label_log[128];
-        snprintf(link_path, sizeof(link_path),
-                 "%s/%s.log", state->session_path, fresh->tty_name);
-        snprintf(label_log, sizeof(label_log), "%s.log", fresh->label);
-        if (access(link_path, F_OK) != 0) {
-            int sret = symlink(label_log, link_path);
-            (void)sret;
-        }
-    }
-
     /* recreate the friendly-name PTY symlink pointing at the same slave */
     if (mp->serial.pty_master >= 0)
         pty_create_symlink(fresh->label, mp->serial.pty_path);
@@ -996,6 +1178,65 @@ apply_identify_result(monitor_state_t *state, const identify_result_t *r)
  * freshly created node yet -- without waiting for a manual SIGHUP or a
  * daemon restart. Mirrors the SIGHUP rescan path. Returns the number of
  * ports newly added. */
+/* Consecutive failed add attempts per /dev node. serial_open() stays
+ * quiet about EACCES because it is almost always the udev ACL race that
+ * the next retry wins; this is what escalates a node that never comes
+ * good, so a genuine permissions problem is still reported once. */
+#define OPEN_FAIL_TABLE_SZ  32
+#define OPEN_FAIL_REPORT_AT 5
+
+static struct {
+    char dev_path[256];
+    int  attempts;
+    int  reported;
+} open_fail[OPEN_FAIL_TABLE_SZ];
+static int open_fail_count = 0;
+
+static void
+open_fail_note(const char *dev_path, int failed)
+{
+    int i, slot = -1;
+
+    for (i = 0; i < open_fail_count; i++) {
+        if (strcmp(open_fail[i].dev_path, dev_path) == 0) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (!failed) {
+        /* Succeeded: forget the history so a later race starts fresh. */
+        if (slot >= 0) {
+            open_fail[slot] = open_fail[--open_fail_count];
+            memset(&open_fail[open_fail_count], 0,
+                   sizeof(open_fail[open_fail_count]));
+        }
+        return;
+    }
+
+    if (slot < 0) {
+        if (open_fail_count >= OPEN_FAIL_TABLE_SZ)
+            return;
+        slot = open_fail_count++;
+        memset(&open_fail[slot], 0, sizeof(open_fail[slot]));
+        strlcpy_safe(open_fail[slot].dev_path, dev_path,
+                     sizeof(open_fail[slot].dev_path));
+    }
+
+    open_fail[slot].attempts++;
+    if (open_fail[slot].attempts >= OPEN_FAIL_REPORT_AT &&
+        !open_fail[slot].reported) {
+        open_fail[slot].reported = 1;
+        /* Deliberately no strerror(): by this point errno has been
+         * clobbered by the bookkeeping add_port() does after the failed
+         * open, so quoting it would misreport the cause. */
+        fprintf(stderr, "monitor: %s enumerated but still cannot be "
+                "opened after %d attempts; check permissions (udev rule / "
+                "group) and whether another process holds it\n",
+                dev_path, open_fail[slot].attempts);
+    }
+}
+
 static int
 rescan_and_add(monitor_state_t *state)
 {
@@ -1012,8 +1253,13 @@ rescan_and_add(monitor_state_t *state)
     for (i = 0; i < nports; i++) {
         if (find_port_by_path(state, ports[i].dev_path) >= 0)
             continue; /* already monitoring */
-        if (add_port(state, &ports[i]) < 0)
-            continue; /* filtered out, or still failing -- retry next pass */
+        if (add_port(state, &ports[i]) < 0) {
+            /* filtered out, or still failing -- retry next pass */
+            if (port_matches_filter(ports[i].dev_path, state->only_filter))
+                open_fail_note(ports[i].dev_path, 1);
+            continue;
+        }
+        open_fail_note(ports[i].dev_path, 0);
         added++;
         /* resolve the real board name off-thread if still ambiguous */
         if (port_needs_probe(&ports[i]) &&
@@ -1195,7 +1441,7 @@ handle_hotplug(monitor_state_t *state)
         return;
 
     if (hev.action == HOTPLUG_ADD) {
-        printf("  Hot-plug: %s added\n", hev.devpath);
+        int quiet = 0;
 
         /* Cheap (sysfs-only) identify so we can start logging immediately;
          * the slow SWD/CLI probe runs off-thread in the identify worker.
@@ -1210,6 +1456,12 @@ handle_hotplug(monitor_state_t *state)
             int existing;
             if (nbids > 0)
                 apply_board_config(&port, 1, bids, nbids);
+
+            /* Identity is known now, so we can tell whether this device
+             * is mid-flap and keep the per-event chatter down. */
+            quiet = flap_is_flapping(&port);
+            if (!quiet)
+                printf("  Hot-plug: %s added\n", hev.devpath);
 
             /* If this node was already monitored but the hardware behind
              * it changed (board swapped onto the same tty node), drop the
@@ -1230,7 +1482,7 @@ handle_hotplug(monitor_state_t *state)
              * settle window since the device was just hot-plugged. Skip
              * yielded ports. */
             existing = find_port_by_path(state, hev.devpath);
-            if (existing >= 0 && !state->ports[existing].yielded &&
+            if (existing >= 0 && !state->ports[existing].yielded && !quiet &&
                 port_needs_probe(&state->ports[existing].identity))
                 iw_submit(state->iw, hev.devpath, 800);
 
@@ -1239,14 +1491,18 @@ handle_hotplug(monitor_state_t *state)
              * fast reconcile to retry shortly rather than leaving it dark
              * until the periodic sweep. */
             if (existing < 0 &&
-                port_matches_filter(hev.devpath, state->only_filter))
+                port_matches_filter(hev.devpath, state->only_filter)) {
+                open_fail_note(hev.devpath, 1);
                 schedule_fast_reconcile(state);
+            } else if (existing >= 0) {
+                open_fail_note(hev.devpath, 0);
+            }
         }
     } else if (hev.action == HOTPLUG_REMOVE) {
-        printf("  Hot-plug: %s removed\n", hev.devpath);
-
         int idx = find_port_by_path(state, hev.devpath);
         if (idx >= 0) {
+            if (!flap_is_flapping(&state->ports[idx].identity))
+                printf("  Hot-plug: %s removed\n", hev.devpath);
             remove_port(state, idx);
             write_status_json(state);
         }
@@ -1328,8 +1584,8 @@ cmd_monitor(int argc, char *argv[])
     }
 
     /* ensure base directory exists */
-    if (mkdirp(LOG_BASE_DIR) < 0) {
-        fprintf(stderr, "monitor: cannot create %s\n", LOG_BASE_DIR);
+    if (mkdirp(log_base_dir_path()) < 0) {
+        fprintf(stderr, "monitor: cannot create %s\n", log_base_dir_path());
         return 1;
     }
 
@@ -1346,8 +1602,8 @@ cmd_monitor(int argc, char *argv[])
 
     /* create PTY directory for proxy mode */
     if (state.proxy_mode) {
-        if (mkdirp(PTY_DIR) < 0) {
-            fprintf(stderr, "monitor: cannot create %s\n", PTY_DIR);
+        if (mkdirp(log_pty_dir_path()) < 0) {
+            fprintf(stderr, "monitor: cannot create %s\n", log_pty_dir_path());
         }
     }
 
@@ -1429,7 +1685,7 @@ cmd_monitor(int argc, char *argv[])
     state.reconcile_deadline.tv_sec += RECONCILE_INTERVAL_SEC;
 
     /* setup control socket */
-    state.control_fd = control_init(CONTROL_SOCK_PATH);
+    state.control_fd = control_init(log_control_sock_path());
     if (state.control_fd >= 0) {
         state.evt_control.type = EVT_CONTROL;
         state.evt_control.fd = state.control_fd;
@@ -1473,9 +1729,9 @@ cmd_monitor(int argc, char *argv[])
 
     printf("Monitoring... (Ctrl-C to stop)\n");
     if (!foreground)
-        printf("Logs: %s/latest/*.log\n", LOG_BASE_DIR);
+        printf("Logs: %s/latest/*.log\n", log_base_dir_path());
     if (state.proxy_mode)
-        printf("PTY devices: %s/*\n", PTY_DIR);
+        printf("PTY devices: %s/*\n", log_pty_dir_path());
 
     /* ---- main event loop ---- */
     struct pollfd pfds[MAX_POLL_FDS];
@@ -1731,7 +1987,7 @@ cmd_monitor(int argc, char *argv[])
         hotplug_close(state.hotplug_fd);
     if (state.inotify_fd >= 0)
         close(state.inotify_fd); /* frees all remaining watches */
-    control_close(state.control_fd, CONTROL_SOCK_PATH);
+    control_close(state.control_fd, log_control_sock_path());
     if (state.signal_fd >= 0)
         close(state.signal_fd);
     if (g_signal_pipe_w >= 0) {
@@ -1740,11 +1996,11 @@ cmd_monitor(int argc, char *argv[])
     }
 
     pidfile_remove();
-    unlink(STATUS_FILE);
+    unlink(log_status_file_path());
 
     /* clean up PTY directory if empty */
     if (state.proxy_mode)
-        rmdir(PTY_DIR);
+        rmdir(log_pty_dir_path());
 
     if (state.systemd_mode)
         sd_notify_send("STOPPING=1");

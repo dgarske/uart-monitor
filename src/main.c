@@ -40,6 +40,7 @@ usage(const char *prog)
         "  yield <dev>     Release a port for flashing\n"
         "  reclaim <dev>   Re-acquire a yielded port\n"
         "  clear <dev>     Truncate log for a port (or --all)\n"
+        "  baud <dev> <n>  Change a port's baud rate\n"
         "  tail <dev>      Tail the latest log for a port\n"
         "\n"
         "Monitor options:\n"
@@ -56,6 +57,9 @@ usage(const char *prog)
         "\n"
         "Log files:  /tmp/uart-monitor/latest/<LABEL>.log\n"
         "PTY proxy:  /tmp/uart-monitor/pty/<LABEL>  (with --proxy)\n"
+        "Set UART_MONITOR_DIR to relocate all of the above (logs, status,\n"
+        "  PID file and control socket) -- use it to run a second, fully\n"
+        "  isolated instance without disturbing the shared daemon.\n"
         "\n"
         "AI workflow: tail -f /tmp/uart-monitor/latest/POLARFIRE_SOC_UART0.log\n",
         prog);

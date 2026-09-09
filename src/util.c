@@ -205,7 +205,7 @@ status_lookup(const char *device_or_label,
     if (device_or_label == NULL)
         return -1;
 
-    FILE *fp = fopen(LOG_BASE_DIR "/status.json", "r");
+    FILE *fp = fopen(log_status_file_path(), "r");
     if (fp == NULL)
         return -1;
 

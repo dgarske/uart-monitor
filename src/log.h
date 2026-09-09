@@ -42,7 +42,21 @@ typedef struct {
     struct timespec last_flush;
 } log_file_t;
 
-/* Create a new session directory under LOG_BASE_DIR and update the
+/* Runtime paths. All of these live under the base directory, which is
+ * LOG_BASE_DIR unless UART_MONITOR_DIR overrides it. They are functions
+ * rather than compile-time constants so that a second instance started
+ * with UART_MONITOR_DIR set is FULLY isolated: with the PID file, status
+ * file and control socket hardcoded to /tmp/uart-monitor, a test daemon
+ * would overwrite the live daemon's state and hijack its socket, which on
+ * a shared bench means every board's logging. Each returns a pointer to
+ * static storage, valid for the life of the process. */
+const char *log_base_dir_path(void);
+const char *log_pid_file_path(void);
+const char *log_status_file_path(void);
+const char *log_control_sock_path(void);
+const char *log_pty_dir_path(void);
+
+/* Create a new session directory under the base directory and update the
  * "latest" symlink. Writes session name into session_path.
  * Returns 0 on success. */
 int log_create_session(char *session_path, size_t sz);

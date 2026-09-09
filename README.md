@@ -127,6 +127,7 @@ Use `bootout` + `bootstrap` only when the plist itself changed (launchd caches t
 uart-monitor identify           # Scan and identify USB serial ports
 uart-monitor identify -v        # Verbose output with labels
 uart-monitor identify --save    # Save config to ~/.boards
+uart-monitor baud <dev> <rate>  # Change a port's baud rate at runtime
 
 uart-monitor monitor -f         # Start monitoring (foreground, read-only)
 uart-monitor monitor -f --proxy # PTY proxy mode (bidirectional)
@@ -243,9 +244,8 @@ my-flash-tool --port /tmp/uart-monitor/pty/POLARFIRE_SOC_UART0
     POLARFIRE_SOC_UART0.log                  # log file named by board label
     POLARFIRE_SOC_UART1.log
     STM32H563_UART.log
-    ttyUSB0.log -> POLARFIRE_SOC_UART0.log   # compat symlink (tty name)
-    ttyUSB1.log -> POLARFIRE_SOC_UART1.log
-    ttyACM0.log -> STM32H563_UART.log
+    GENERIC_UART_AL00KKC6.log                # unidentified: keyed by USB serial
+    FTDI_FT4232H_UART0_1_6_1.log             # no serial: keyed by USB topology
   pty/                                       # (proxy mode only)
     POLARFIRE_SOC_UART0 -> /dev/pts/5
     POLARFIRE_SOC_UART1 -> /dev/pts/6
@@ -253,6 +253,28 @@ my-flash-tool --port /tmp/uart-monitor/pty/POLARFIRE_SOC_UART0
   uart-monitor.sock                          # control socket
   uart-monitor.pid                           # PID file
 ```
+
+There are no `ttyUSB0.log -> LABEL.log` aliases. A tty number is not a stable
+identity -- the kernel recycles minor numbers, so such an alias outlived the
+board that created it and quietly pointed at the wrong log after a
+re-enumeration. Look a port up by its `/dev` path instead (`uart-monitor tail
+ttyUSB0` still works; it resolves the path through `status.json`).
+
+### Port Labels
+
+A label names the log file and the PTY symlink, so it has to survive a device
+re-enumerating. It is built from the most stable identifier the port has:
+
+| Available | Label form | Example |
+|-----------|-----------|---------|
+| `~/.boards` pin | `<BOARD>_UART[<iface>]` | `POLARFIRE_SOC_UART0` |
+| Probe / product match | `<BOARD>_UART[<iface>]` | `NUCLEO_H563ZI_UART` |
+| USB serial | `<CHIP>_UART[<iface>]_<serial>` | `GENERIC_UART_AL00KKC6` |
+| USB topology only | `<CHIP>_UART[<iface>]_<path>` | `FTDI_FT4232H_UART0_1_6_1` |
+
+The interface number is always present for a multi-port bridge. Without it the
+four interfaces of a serial-less FT4232H collapse onto one label and share a
+single log file and a single PTY symlink.
 
 ### Log Format
 
@@ -295,35 +317,79 @@ Started: 2026-02-25 14:30:12.456
       "label": "POLARFIRE_SOC_UART0",
       "board": "PolarFire SoC",
       "function": "UART0",
+      "vid": "10c4",
+      "pid": "ea71",
       "status": "monitoring",
       "log_file": "/tmp/uart-monitor/session-20260225-143012/POLARFIRE_SOC_UART0.log",
       "pty_device": "/tmp/uart-monitor/pty/POLARFIRE_SOC_UART0",
       "pty_slave": "/dev/pts/5",
-      "bytes_logged": 45678
+      "bytes_logged": 45678,
+      "flapping": false,
+      "disconnect_count": 0,
+      "last_disconnect": 0
+    }
+  ],
+  "total_ports": 12,
+  "identified_ports": [
+    {
+      "device": "/dev/ttyUSB9",
+      "label": "GENERIC_UART_AL00KKC6",
+      "board": "Generic",
+      "function": "Main UART",
+      "vid": "0403",
+      "pid": "6001",
+      "status": "not_monitored"
     }
   ]
 }
 ```
 
+`identified_ports` lists eligible ports the daemon is not monitoring (filtered
+out by `--only`, or not yet openable).
+
+`flapping` is set when a port has re-enumerated repeatedly in a short window --
+usually an unpowered board or a failing cable. While a port is flapping the
+daemon quiets its per-event logging and defers the external identify probe
+until the hardware settles; `disconnect_count` is the running total and
+`last_disconnect` a Unix timestamp. This is the first thing to check when a
+port is dark or its log is full of reconnects.
+
 ## Supported Boards
 
 | VID:PID | Chip | Boards |
 |---------|------|--------|
-| 0403:6010 | FTDI FT2232H | VMK180, ZCU102 |
-| 0403:6011 | FTDI FT4232H | VMK180, ZCU102 |
+| 0403:6010 | FTDI FT2232H | VMK180, ZCU102, Various (ambiguous) |
+| 0403:6011 | FTDI FT4232H | VMK180, ZCU102, SCU35 (ambiguous) |
 | 0403:6014 | FTDI FT232H | Generic |
 | 0403:6001 | FTDI FT232R | Generic |
 | 04b4:0008 | Cypress FX3 | Versal VMK180, ZCU102 |
 | 10c4:ea71 | Silicon Labs CP210x | PolarFire SoC |
-| 10c4:ea60 | Silicon Labs CP210x | PolarFire SoC, Generic |
-| 0483:374b | STM32 ST-LINK | STM32H563 |
-| 0483:374e | STM32 Virtual COM | STM32H563 |
+| 10c4:ea60 | Silicon Labs CP210x | Generic, ZC702, PolarFire SoC |
+| 1fc9:0090 | NXP LPC-Link2 CMSIS-DAP | LPC54S018M-EVK |
+| 0483:374b | STM32 ST-LINK | probed |
+| 0483:374e | STM32 Virtual COM Port | probed |
+| 0483:3754 | STM32 STLINK-V3 | probed |
+| 0483:374f | STM32 STLINK-V3 | probed |
 | 0483:5740 | STM32 USB CDC | USB Relay Controller |
 | 1a86:7523 | CH340 | USB Relay, Generic |
 | 067b:2303 | Prolific PL2303 | Generic |
+| 067b:23a3 | Prolific PL2303GC | Generic |
+| 110a:1150 | Moxa UPort 1150 | Moxa UPort 1150 |
+| 1514:2008 | Microsemi FlashPro5 | Microchip FlashPro5 |
+| 0897:0002 | Lauterbach TRACE32 | Debugger |
+| 0451:bef3 | TI XDS110 | TI XDS110 |
+| 1366:0105 | SEGGER J-Link | SEGGER J-Link |
+| 0416:2004 | Nuvoton Nu-Link2 | Nuvoton Nu-Link2 |
 
-Board identifications from `~/.boards` (generated by `identify_tty_ports.py
---save`) are automatically applied as overrides.
+"probed" means the VID:PID is shared across many boards, so the real board is
+resolved at runtime via `STM32_Programmer_CLI` / `st-info`.
+
+An "(ambiguous)" device lists several candidate boards, and none of them is
+authoritative. Such a port reports `"board": "Unknown"` until a pin or a probe
+resolves it -- naming the first candidate would be a guess presented as fact.
+Pin it in `~/.boards` to give it a real name.
+
+Board identifications from `~/.boards` are automatically applied as overrides.
 
 ## Technical Details
 
@@ -440,7 +506,35 @@ For a deterministic, probe-independent override, pin the board by USB serial in 
 # USB: 1-1.2.1 | S/N: 000D001E4D4B500C20373831
 ```
 
-Serial matches are authoritative (they bypass the VID:PID compatibility check), apply on every hot-plug, and survive a daemon restart. Apply with `systemctl --user restart uart-monitor` on Linux, or `launchctl kickstart -k gui/$(id -u)/com.wolfssl.uart-monitor` on macOS. A `SIGHUP` rescan (`systemctl --user reload uart-monitor`) re-reads `~/.boards`, but only applies it to ports that are not already being monitored -- changing the pin on a port the daemon already holds needs a full restart.
+Serial matches are authoritative (they bypass the VID:PID compatibility check) and apply on every hot-plug.
+
+Apply a change with `systemctl --user reload uart-monitor` (SIGHUP) on Linux, or `launchctl kickstart -k gui/$(id -u)/com.wolfssl.uart-monitor` on macOS. A SIGHUP re-reads `~/.boards` and applies it to ports the daemon is **already** monitoring as well as new ones: a port whose pin changed is relabelled in place, reopening only its log file and PTY symlink and never the USB device, so no other board's capture is disturbed. A full restart is not needed, which matters on a shared bench where restarting the daemon blacks out logging for every board at once.
+
+#### Pinning a device that reports no serial
+
+Some adapters are strapped with `SerialNumber=0` (an FT4232H on many dev boards, for instance). They have no serial to pin by, and their `/dev` path floats on every replug, so pin them by USB topology instead -- give a `# USB:` line with no `S/N:`:
+
+```
+# === IMX8QM_MEK ===
+# Baud: 115200
+# USB: 1-6.1
+```
+
+The topology path is the hub port the cable is plugged into (`1-6.1`), stable until the cable is moved. `uart-monitor identify` prints it as `USB Path` for every device. The override applies to the whole USB device, so all four interfaces of a quad bridge pick it up and are auto-suffixed `_UART0` through `_UART3`.
+
+Note that when an entry has **both** `# USB:` and `S/N:`, only the serial is used as a match key -- the topology value is then just a note recording where the board was last seen, and those notes go stale as boards move.
+
+#### Pinning by `/dev` path
+
+A bare `LABEL=/dev/ttyUSBn` line still works, but it is the weakest key and is checked against the device actually sitting on that path: the kernel recycles tty minor numbers, so a pin written months ago can land on an unrelated board. If the VID:PID there is not consistent with the pinned board the pin is ignored and the daemon says so once:
+
+```
+identify: ~/.boards pin 'Generic PL2303 Adapter=/dev/ttyUSB8' ignored: that
+path is now a Microsemi FlashPro5 (1514:2008). Re-pin it by serial, or by
+'# USB: 1-8.4'.
+```
+
+Each `# === Board ===` section contributes at most one pin, and a stronger key wins: a `# USB:`/`S/N:` line overrides a `LABEL=/dev/...` line in the same section. The remaining `LABEL=` lines in a section are treated as the operator's notes on the device's other interfaces.
 
 ## Future TODO
 

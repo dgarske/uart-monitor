@@ -44,6 +44,55 @@ log_base_dir(void)
     return LOG_BASE_DIR;
 }
 
+/* Build "<base>/<suffix>" once into a static buffer. */
+static const char *
+log_sub_path(char *buf, size_t sz, int *done, const char *suffix)
+{
+    if (!*done) {
+        snprintf(buf, sz, "%s/%s", log_base_dir(), suffix);
+        *done = 1;
+    }
+    return buf;
+}
+
+const char *
+log_base_dir_path(void)
+{
+    return log_base_dir();
+}
+
+const char *
+log_pid_file_path(void)
+{
+    static char buf[512];
+    static int done = 0;
+    return log_sub_path(buf, sizeof(buf), &done, "uart-monitor.pid");
+}
+
+const char *
+log_status_file_path(void)
+{
+    static char buf[512];
+    static int done = 0;
+    return log_sub_path(buf, sizeof(buf), &done, "status.json");
+}
+
+const char *
+log_control_sock_path(void)
+{
+    static char buf[512];
+    static int done = 0;
+    return log_sub_path(buf, sizeof(buf), &done, "uart-monitor.sock");
+}
+
+const char *
+log_pty_dir_path(void)
+{
+    static char buf[512];
+    static int done = 0;
+    return log_sub_path(buf, sizeof(buf), &done, "pty");
+}
+
 int
 log_create_session(char *session_path, size_t sz)
 {

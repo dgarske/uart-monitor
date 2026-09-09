@@ -71,8 +71,15 @@ serial_open(serial_port_t *sp, const char *dev_path, speed_t baud)
 
     int fd = open(dev_path, O_RDONLY | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
-        fprintf(stderr, "serial: cannot open %s: %s\n",
-                dev_path, strerror(errno));
+        /* EACCES on a freshly enumerated node is the expected udev race:
+         * the device node exists before udev has applied the group/ACL.
+         * The daemon retries shortly and normally wins, so reporting it
+         * here just prints an alarming error per hot-plug event -- four
+         * per cycle on a quad bridge. Leave errno for the caller, which
+         * escalates only if the retries are exhausted. */
+        if (errno != EACCES)
+            fprintf(stderr, "serial: cannot open %s: %s\n",
+                    dev_path, strerror(errno));
         return -1;
     }
 
@@ -98,8 +105,11 @@ serial_open_proxy(serial_port_t *sp, const char *dev_path, speed_t baud)
     /* open real port O_RDWR for bidirectional proxy */
     int fd = open(dev_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
-        fprintf(stderr, "serial: cannot open %s (proxy): %s\n",
-                dev_path, strerror(errno));
+        /* See serial_open(): EACCES here is the udev ACL race, not a
+         * fault worth reporting on every hot-plug event. */
+        if (errno != EACCES)
+            fprintf(stderr, "serial: cannot open %s (proxy): %s\n",
+                    dev_path, strerror(errno));
         return -1;
     }
 

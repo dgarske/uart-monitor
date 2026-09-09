@@ -23,7 +23,6 @@
 
 #include <termios.h>
 
-#define PTY_DIR  LOG_BASE_DIR "/pty"
 
 typedef struct {
     int     fd;              /* real serial port fd */

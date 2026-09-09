@@ -21,7 +21,6 @@
 #ifndef CONTROL_H
 #define CONTROL_H
 
-#define CONTROL_SOCK_PATH LOG_BASE_DIR "/uart-monitor.sock"
 /* STATUS responses include all monitored ports; with ~150 bytes per
  * port and MAX_PORTS=64 this fits comfortably under 16 KB.  Bumped
  * to 64 KB to leave headroom; both server (resp[]) and client (buf[])

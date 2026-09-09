@@ -135,7 +135,7 @@ int
 cmd_status(int argc, char *argv[])
 {
     (void)argc; (void)argv;
-    return control_send_cmd(CONTROL_SOCK_PATH, "STATUS\n");
+    return control_send_cmd(log_control_sock_path(), "STATUS\n");
 }
 
 int
@@ -148,7 +148,7 @@ cmd_yield(int argc, char *argv[])
     }
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "YIELD %s\n", argv[1]);
-    return control_send_cmd(CONTROL_SOCK_PATH, cmd);
+    return control_send_cmd(log_control_sock_path(), cmd);
 }
 
 int
@@ -161,14 +161,14 @@ cmd_reclaim(int argc, char *argv[])
     }
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "RECLAIM %s\n", argv[1]);
-    return control_send_cmd(CONTROL_SOCK_PATH, cmd);
+    return control_send_cmd(log_control_sock_path(), cmd);
 }
 
 int
 cmd_clear(int argc, char *argv[])
 {
     if (argc >= 2 && strcmp(argv[1], "--all") == 0) {
-        return control_send_cmd(CONTROL_SOCK_PATH, "CLEAR --all\n");
+        return control_send_cmd(log_control_sock_path(), "CLEAR --all\n");
     }
 
     if (argc < 2) {
@@ -183,7 +183,7 @@ cmd_clear(int argc, char *argv[])
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "CLEAR %s\n", argv[1]);
-    return control_send_cmd(CONTROL_SOCK_PATH, cmd);
+    return control_send_cmd(log_control_sock_path(), cmd);
 }
 
 int
@@ -198,7 +198,7 @@ cmd_baud(int argc, char *argv[])
     }
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "BAUD %s %s\n", argv[1], argv[2]);
-    return control_send_cmd(CONTROL_SOCK_PATH, cmd);
+    return control_send_cmd(log_control_sock_path(), cmd);
 }
 
 int
@@ -221,7 +221,7 @@ cmd_tail(int argc, char *argv[])
     /* try direct path: /tmp/uart-monitor/latest/<name>.log */
     char logpath[512];
     snprintf(logpath, sizeof(logpath),
-             "%s/latest/%s.log", LOG_BASE_DIR, name);
+             "%s/latest/%s.log", log_base_dir_path(), name);
 
     if (access(logpath, R_OK) != 0) {
         /* fall back to the running daemon's status.json -- resolves
@@ -230,13 +230,13 @@ cmd_tail(int argc, char *argv[])
         if (status_lookup(arg, NULL, 0, logpath, sizeof(logpath)) != 0 ||
             access(logpath, R_OK) != 0) {
             fprintf(stderr, "Log file not found: %s/latest/%s.log\n",
-                    LOG_BASE_DIR, name);
-            fprintf(stderr, "Available logs in %s/latest/:\n", LOG_BASE_DIR);
+                    log_base_dir_path(), name);
+            fprintf(stderr, "Available logs in %s/latest/:\n", log_base_dir_path());
 
             /* list available log files */
             char cmd[512];
             snprintf(cmd, sizeof(cmd),
-                     "ls -1 %s/latest/*.log 2>/dev/null", LOG_BASE_DIR);
+                     "ls -1 %s/latest/*.log 2>/dev/null", log_base_dir_path());
             int ret = system(cmd);
             (void)ret;
             return 1;

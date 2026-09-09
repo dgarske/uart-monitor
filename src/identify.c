@@ -66,23 +66,58 @@ static time_t stlink_probe_cache_time = 0;
 /* Arena for probe-derived board names. The tty_port_t->board_match field
  * is `const char *` and expects pointers that live for the process, so
  * we can't hand out stack buffers. Sized to comfortably hold a unique
- * NUCLEO-* name for every entry in the per-scan probe caches. */
+ * NUCLEO-* name for every entry in the per-scan probe caches.
+ *
+ * Entries are interned, not merely appended: the same board is re-probed
+ * on every hot-plug event, and a port that flaps (a board whose power is
+ * off, a failing cable) re-probes every couple of seconds. Appending a
+ * duplicate per probe would exhaust the arena within hours, after which
+ * intern_board_name() returns NULL and EVERY port's probe result silently
+ * degrades to a generic label -- one dead board corrupting the labels of
+ * the whole bench. The set of distinct board names is small and bounded,
+ * so a linear scan for an existing copy keeps the arena flat. */
 #define PROBE_NAME_ARENA_SZ 4096
 static char probe_name_arena[PROBE_NAME_ARENA_SZ];
 static size_t probe_name_arena_used = 0;
+static int probe_name_arena_warned = 0;
 
-static const char *
+const char *
 intern_board_name(const char *name)
 {
+    size_t need;
+    size_t off;
+    char *slot;
+
     if (!name)
         return NULL;
-    size_t need = strlen(name) + 1;
-    if (probe_name_arena_used + need > sizeof(probe_name_arena))
+
+    /* Already interned? Hand back the existing copy. */
+    for (off = 0; off < probe_name_arena_used;
+         off += strlen(probe_name_arena + off) + 1) {
+        if (strcmp(probe_name_arena + off, name) == 0)
+            return probe_name_arena + off;
+    }
+
+    need = strlen(name) + 1;
+    if (probe_name_arena_used + need > sizeof(probe_name_arena)) {
+        if (!probe_name_arena_warned) {
+            probe_name_arena_warned = 1;
+            fprintf(stderr, "identify: board-name arena full (%zu bytes); "
+                    "further probe results will fall back to generic "
+                    "labels\n", sizeof(probe_name_arena));
+        }
         return NULL;
-    char *slot = probe_name_arena + probe_name_arena_used;
+    }
+    slot = probe_name_arena + probe_name_arena_used;
     memcpy(slot, name, need);
     probe_name_arena_used += need;
     return slot;
+}
+
+size_t
+intern_board_name_used(void)
+{
+    return probe_name_arena_used;
 }
 
 /* Forward decl: defined below the STM32CubeProgrammer probe block. */
@@ -126,31 +161,60 @@ typedef struct {
     char serial[64];
     char usb_path[128];      /* USB topology path, e.g. "1-6.2" */
     const char *board_match; /* interned in probe_name_arena */
+    time_t stamp;            /* last refresh, for the topology-keyed TTL */
 } sticky_identity_t;
 
 #define STICKY_IDENTITY_SZ 64
+
+/* How long a topology-keyed (serial-less) entry stays valid. A USB serial
+ * is globally unique, so a serial-keyed entry can only ever be matched by
+ * the same physical device and never expires. A hub port is not unique
+ * over time -- unplug one serial-less adapter and plug in another, and the
+ * topology path is identical -- so those entries age out. */
+#define STICKY_IDENTITY_PATH_TTL_SEC 3600
+
 static sticky_identity_t sticky_identity[STICKY_IDENTITY_SZ];
 static int sticky_identity_count = 0;
 
-/* Look up a remembered board name. Try the USB serial first (authoritative
- * and stable), then fall back to the USB topology path so a device that
- * re-enumerates with a different sysfs serial -- but stays in the same
- * physical hub port -- still recovers its real board name. */
+/* Look up a remembered board name.
+ *
+ * A device with a USB serial is matched on that serial alone. It must NOT
+ * fall back to the topology path: a *different* board plugged into a hub
+ * port previously used by another board would otherwise inherit the old
+ * board's name whenever its own probe failed, which is precisely the
+ * stale-label failure this cache is supposed to prevent.
+ *
+ * The topology fallback exists for devices that report no serial at all
+ * (e.g. an FT4232H strapped with SerialNumber=0), which have no other
+ * stable key. Those match only against other serial-less entries, and
+ * only within the TTL. */
 static const char *
 sticky_identity_lookup(const char *serial, const char *usb_path)
 {
     int i;
+    time_t now;
+
     if (serial && serial[0] != '\0') {
         for (i = 0; i < sticky_identity_count; i++) {
-            if (strcmp(sticky_identity[i].serial, serial) == 0)
+            if (sticky_identity[i].serial[0] != '\0' &&
+                strcmp(sticky_identity[i].serial, serial) == 0)
                 return sticky_identity[i].board_match;
         }
+        return NULL;
     }
+
     if (usb_path && usb_path[0] != '\0') {
+        now = time(NULL);
         for (i = 0; i < sticky_identity_count; i++) {
-            if (sticky_identity[i].usb_path[0] != '\0' &&
-                strcmp(sticky_identity[i].usb_path, usb_path) == 0)
-                return sticky_identity[i].board_match;
+            if (sticky_identity[i].serial[0] != '\0')
+                continue;   /* belongs to a device that has a serial */
+            if (sticky_identity[i].usb_path[0] == '\0' ||
+                strcmp(sticky_identity[i].usb_path, usb_path) != 0)
+                continue;
+            if (now - sticky_identity[i].stamp >
+                STICKY_IDENTITY_PATH_TTL_SEC)
+                continue;   /* too old to trust for a reusable hub port */
+            return sticky_identity[i].board_match;
         }
     }
     return NULL;
@@ -160,27 +224,52 @@ static void
 sticky_identity_remember(const char *serial, const char *usb_path,
                          const char *board_match)
 {
-    int i;
-    if (!serial || serial[0] == '\0' || !board_match)
+    int i, oldest;
+    int have_serial = (serial != NULL && serial[0] != '\0');
+    int have_path = (usb_path != NULL && usb_path[0] != '\0');
+
+    if (!board_match || (!have_serial && !have_path))
         return;
+
     for (i = 0; i < sticky_identity_count; i++) {
-        if (strcmp(sticky_identity[i].serial, serial) == 0) {
+        int hit;
+        if (have_serial) {
+            hit = (sticky_identity[i].serial[0] != '\0' &&
+                   strcmp(sticky_identity[i].serial, serial) == 0);
+        } else {
+            hit = (sticky_identity[i].serial[0] == '\0' &&
+                   strcmp(sticky_identity[i].usb_path, usb_path) == 0);
+        }
+        if (hit) {
             sticky_identity[i].board_match = board_match;
-            if (usb_path)
+            if (have_path)
                 strlcpy_safe(sticky_identity[i].usb_path, usb_path,
                              sizeof(sticky_identity[i].usb_path));
+            sticky_identity[i].stamp = time(NULL);
             return;
         }
     }
+
     if (sticky_identity_count < STICKY_IDENTITY_SZ) {
-        strlcpy_safe(sticky_identity[sticky_identity_count].serial,
-                     serial, sizeof(sticky_identity[0].serial));
-        if (usb_path)
-            strlcpy_safe(sticky_identity[sticky_identity_count].usb_path,
-                         usb_path, sizeof(sticky_identity[0].usb_path));
-        sticky_identity[sticky_identity_count].board_match = board_match;
-        sticky_identity_count++;
+        oldest = sticky_identity_count++;
+    } else {
+        /* Full: evict the least recently refreshed entry rather than
+         * silently dropping every new identity for the daemon's life. */
+        oldest = 0;
+        for (i = 1; i < sticky_identity_count; i++) {
+            if (sticky_identity[i].stamp < sticky_identity[oldest].stamp)
+                oldest = i;
+        }
     }
+    memset(&sticky_identity[oldest], 0, sizeof(sticky_identity[oldest]));
+    if (have_serial)
+        strlcpy_safe(sticky_identity[oldest].serial, serial,
+                     sizeof(sticky_identity[0].serial));
+    if (have_path)
+        strlcpy_safe(sticky_identity[oldest].usb_path, usb_path,
+                     sizeof(sticky_identity[0].usb_path));
+    sticky_identity[oldest].board_match = board_match;
+    sticky_identity[oldest].stamp = time(NULL);
 }
 
 /* Populate the cache by running `st-info --probe` once. Returns 0 on
@@ -720,18 +809,34 @@ sanitize_label(char *s)
     }
 }
 
-/* Append "_<last 8 chars of serial>" to dst (no-op if no serial).
- * Used to disambiguate labels when probe failed and multiple
- * unresolved devices share the same known_device name. */
+/* Build "_<key>" from the most stable identifier the port has, for use as
+ * a label suffix when the board itself could not be resolved and several
+ * unresolved devices would otherwise share one name.
+ *
+ * Order matters, because the label names the log file and the PTY symlink
+ * and both must survive a re-enumeration:
+ *   serial   - unique and stable. Preferred whenever present.
+ *   usb_path - the hub port. Stable while the cable stays put, and the
+ *              only stable key a serial-less adapter has.
+ *   tty_name - last resort only. The kernel recycles minor numbers, so a
+ *              tty-derived label both renames itself on every replug and
+ *              can be inherited by an unrelated board later.
+ * Writes an empty string only if the port has none of the three. */
 static void
-append_sn_suffix(char *suffix, size_t sz, const char *serial)
+append_stable_suffix(char *suffix, size_t sz, const tty_port_t *port)
 {
     suffix[0] = '\0';
-    if (!serial || !serial[0])
-        return;
-    size_t slen = strlen(serial);
-    const char *tail = serial + (slen > 8 ? slen - 8 : 0);
-    snprintf(suffix, sz, "_%s", tail);
+
+    if (port->serial[0]) {
+        size_t slen = strlen(port->serial);
+        const char *tail = port->serial + (slen > 8 ? slen - 8 : 0);
+        snprintf(suffix, sz, "_%.22s", tail);
+    } else if (port->usb_path[0]) {
+        snprintf(suffix, sz, "_%.22s", port->usb_path);
+    } else if (port->tty_name[0]) {
+        snprintf(suffix, sz, "_%.22s", port->tty_name);
+    }
+    sanitize_label(suffix);
 }
 
 /* Human-readable board name for a port, most specific source first: a
@@ -746,7 +851,15 @@ get_board_name(const tty_port_t *port)
         return port->board_override;
     if (port->board_match)
         return port->board_match;
-    if (port->known && port->known->boards[0])
+    /* boards[0] is only a guess when the VID:PID is shared by several
+     * boards, and reporting a guess as fact is worse than admitting we
+     * don't know: an unpinned FT4232H cable was being reported as a
+     * "VMK180" while the real VMK180 sat on a different USB device. The
+     * label path already declines to name the board in this case, so
+     * returning "Unknown" also keeps status.json and the log header
+     * consistent with the log file name. */
+    if (port->known && port->known->boards[0] &&
+        !known_device_is_ambiguous(port->known))
         return port->known->boards[0];
     return "Unknown";
 }
@@ -793,16 +906,29 @@ get_device_label(tty_port_t *port)
 
     /* Ambiguous device with no resolved board: probe failed (target in
      * reset, no SWD, CLI not installed, etc.).  Use the known_device
-     * name plus an S/N suffix so multiple unresolved boards don't
-     * collide.  E.g. STM32_VIRTUAL_COM_PORT_UART_38363431. */
+     * name plus the interface number and the best stable key available,
+     * so multiple unresolved boards don't collide.
+     * E.g. STM32_VIRTUAL_COM_PORT_UART_38363431, FTDI_FT4232H_UART2_1_7_2.
+     *
+     * The interface number is not optional here. A serial-less multi-port
+     * bridge (an FT4232H strapped with SerialNumber=0) has nothing else to
+     * tell its four interfaces apart, and without it all four collapse
+     * onto one label -- one log file carrying four interleaved consoles,
+     * and three PTY symlinks silently overwritten by the fourth. */
     if (known_device_is_ambiguous(port->known)) {
         char clean[48];
-        char sn_suffix[10];
+        char suffix[24];
         strlcpy_safe(clean, port->known->name, sizeof(clean));
         sanitize_label(clean);
-        append_sn_suffix(sn_suffix, sizeof(sn_suffix), port->serial);
-        snprintf(port->label, sizeof(port->label),
-                 "%.40s_UART%s", clean, sn_suffix);
+        append_stable_suffix(suffix, sizeof(suffix), port);
+        if (port->known->expected_ports > 1) {
+            snprintf(port->label, sizeof(port->label),
+                     "%.20s_UART%d%.22s", clean, port->interface_num,
+                     suffix);
+        } else {
+            snprintf(port->label, sizeof(port->label),
+                     "%.24s_UART%.22s", clean, suffix);
+        }
         return;
     }
 
@@ -813,16 +939,40 @@ get_device_label(tty_port_t *port)
         strlcpy_safe(clean, board, sizeof(clean));
         sanitize_label(clean);
         if (strcmp(clean, "GENERIC") == 0) {
-            /* Generic devices: include tty name to avoid collisions
-             * when multiple unidentified adapters are present */
+            /* Generic devices: append the best stable key so several
+             * unidentified adapters don't collide, and so the label does
+             * not change when the tty number does. */
+            char suffix[24];
+            append_stable_suffix(suffix, sizeof(suffix), port);
             snprintf(port->label, sizeof(port->label),
-                     "%.24s_UART_%s", clean, port->tty_name);
+                     "%.24s_UART%.22s", clean, suffix);
         } else if (port->known->expected_ports > 1) {
             snprintf(port->label, sizeof(port->label),
                      "%.48s_UART%d", clean, port->interface_num);
         } else {
             snprintf(port->label, sizeof(port->label),
                      "%.48s_UART", clean);
+        }
+        return;
+    }
+
+    /* Device is not in KNOWN_DEVICES at all. Build from whatever the USB
+     * descriptors offer plus the best stable key, so the label still
+     * survives a re-enumeration; fall back to the bare tty name only when
+     * there is no USB product string either (a real serial port, say). */
+    if (port->product[0]) {
+        char clean[48];
+        char suffix[24];
+        strlcpy_safe(clean, port->product, sizeof(clean));
+        sanitize_label(clean);
+        append_stable_suffix(suffix, sizeof(suffix), port);
+        if (port->interface_num > 0) {
+            snprintf(port->label, sizeof(port->label),
+                     "%.20s_UART%d%.22s", clean, port->interface_num,
+                     suffix);
+        } else {
+            snprintf(port->label, sizeof(port->label),
+                     "%.24s_UART%.22s", clean, suffix);
         }
         return;
     }
@@ -902,6 +1052,14 @@ load_board_config(board_id_t *ids, int max_ids)
     char current_board[128] = {0};
     int current_baud = 0;
     int nids = 0;
+    /* Index of the entry this section has already emitted, or -1. Each
+     * "# === Board ===" section contributes at most one pin; a stronger
+     * key (serial / topology) overwrites a device-path pin in the same
+     * section. Tracking it per section rather than by inspecting the
+     * previously emitted entry is what lets two consecutive path-pinned
+     * sections both load -- the old heuristic silently dropped the
+     * second one. */
+    int section_pin = -1;
 
     while (fgets(line, sizeof(line), fp) && nids < max_ids) {
         /* look for board headers: # === Board Name === */
@@ -923,6 +1081,7 @@ load_board_config(board_id_t *ids, int max_ids)
                 }
             }
             current_baud = 0;
+            section_pin = -1;
             continue;
         }
 
@@ -931,39 +1090,70 @@ load_board_config(board_id_t *ids, int max_ids)
             const char *val = trimmed + 7;
             while (*val == ' ') val++;
             current_baud = atoi(val);
+            if (section_pin >= 0)
+                ids[section_pin].baud = current_baud;
             continue;
         }
 
-        /* look for: # USB: <path> | S/N: <serial> */
-        if (current_board[0] && strstr(line, "# USB:") &&
-            strstr(line, "S/N:")) {
+        /* look for: # USB: <path>  (optionally followed by | S/N: <serial>)
+         *
+         * Both keys are precise, so this line always claims the section's
+         * pin slot, overwriting a device-path pin picked up earlier in the
+         * same section. A section that gives only a topology path still
+         * yields a usable pin -- that is the only stable key available for
+         * an adapter that reports no serial. */
+        if (current_board[0] && strstr(line, "# USB:")) {
+            const char *up = strstr(line, "# USB:") + 6;
             const char *sn = strstr(line, "S/N:");
+            char usb_path[128];
+            char serial[64];
+            int si = 0;
+
+            while (*up == ' ') up++;
+            while (*up && *up != '\n' && *up != '\r' && *up != ' ' &&
+                   *up != '|' && si < (int)sizeof(usb_path) - 1) {
+                usb_path[si++] = *up++;
+            }
+            usb_path[si] = '\0';
+
+            serial[0] = '\0';
             if (sn) {
                 sn += 4;
                 while (*sn == ' ') sn++;
-                char serial[64];
-                int si = 0;
+                si = 0;
                 while (*sn && *sn != '\n' && *sn != '\r' && *sn != ' ' &&
                        si < (int)sizeof(serial) - 1) {
                     serial[si++] = *sn++;
                 }
                 serial[si] = '\0';
+            }
 
-                if (serial[0]) {
-                    strlcpy_safe(ids[nids].serial, serial,
-                                sizeof(ids[nids].serial));
-                    strlcpy_safe(ids[nids].board_name, current_board,
-                                sizeof(ids[nids].board_name));
-                    ids[nids].baud = current_baud;
-                    ids[nids].dev_path[0] = '\0';
+            if (serial[0] || usb_path[0]) {
+                int slot = (section_pin >= 0) ? section_pin : nids;
+                memset(&ids[slot], 0, sizeof(ids[slot]));
+                strlcpy_safe(ids[slot].serial, serial,
+                             sizeof(ids[slot].serial));
+                strlcpy_safe(ids[slot].usb_path, usb_path,
+                             sizeof(ids[slot].usb_path));
+                strlcpy_safe(ids[slot].board_name, current_board,
+                             sizeof(ids[slot].board_name));
+                ids[slot].baud = current_baud;
+                if (section_pin < 0) {
+                    section_pin = nids;
                     nids++;
                 }
             }
+            continue;
         }
 
         /* look for: LABEL=/dev/ttyUSBN or LABEL=/dev/cu.usbserial-XX
-         * (device path assignment, no S/N) */
-        if (current_board[0] && trimmed[0] != '#' && trimmed[0] != '\n') {
+         * (device path assignment). Only the first such line in a section
+         * counts, and only when the section has offered no stronger key --
+         * the remaining LABEL= lines are the operator's notes on the other
+         * interfaces of the same physical device, and the override is
+         * applied per device, not per interface. */
+        if (current_board[0] && section_pin < 0 &&
+            trimmed[0] != '#' && trimmed[0] != '\n') {
             char *eq = strchr(trimmed, '=');
             if (eq && strncmp(eq + 1, "/dev/", 5) == 0) {
                 /* extract device path (strip trailing comment/whitespace) */
@@ -977,16 +1167,14 @@ load_board_config(board_id_t *ids, int max_ids)
                 }
                 dev[di] = '\0';
 
-                /* only add if no S/N entry was already added for this board */
-                if (dev[0] && ids[nids > 0 ? nids - 1 : 0].dev_path[0] == '\0'
-                    && (nids == 0 ||
-                        strcmp(ids[nids-1].board_name, current_board) != 0)) {
+                if (dev[0]) {
+                    memset(&ids[nids], 0, sizeof(ids[nids]));
                     strlcpy_safe(ids[nids].dev_path, dev,
                                 sizeof(ids[nids].dev_path));
-                    ids[nids].serial[0] = '\0';
                     strlcpy_safe(ids[nids].board_name, current_board,
                                 sizeof(ids[nids].board_name));
                     ids[nids].baud = current_baud;
+                    section_pin = nids;
                     nids++;
                 }
             }
@@ -997,53 +1185,118 @@ load_board_config(board_id_t *ids, int max_ids)
     return nids;
 }
 
+/* apply_board_config() runs on every status.json write, so a rejected pin
+ * must not print on every pass. Remember which (pin, board) pairs have
+ * already been reported; the table is tiny and the daemon is long-lived. */
+#define STALE_PIN_WARN_SZ 32
+static struct {
+    char dev_path[256];
+    char board_name[128];
+} stale_pin_warned[STALE_PIN_WARN_SZ];
+static int stale_pin_warned_count = 0;
+
+static void
+warn_stale_pin_once(const board_id_t *id, const tty_port_t *port)
+{
+    int i;
+
+    for (i = 0; i < stale_pin_warned_count; i++) {
+        if (strcmp(stale_pin_warned[i].dev_path, id->dev_path) == 0 &&
+            strcmp(stale_pin_warned[i].board_name, id->board_name) == 0)
+            return;
+    }
+    if (stale_pin_warned_count < STALE_PIN_WARN_SZ) {
+        strlcpy_safe(stale_pin_warned[stale_pin_warned_count].dev_path,
+                     id->dev_path,
+                     sizeof(stale_pin_warned[0].dev_path));
+        strlcpy_safe(stale_pin_warned[stale_pin_warned_count].board_name,
+                     id->board_name,
+                     sizeof(stale_pin_warned[0].board_name));
+        stale_pin_warned_count++;
+    }
+
+    fprintf(stderr,
+            "identify: ~/.boards pin '%s=%s' ignored: that path is now a "
+            "%s (%04x:%04x). Re-pin it by serial, or by '# USB: %s'.\n",
+            id->board_name, id->dev_path,
+            port->known ? port->known->name : "different device",
+            port->vid, port->pid,
+            port->usb_path[0] ? port->usb_path : "<topology>");
+}
+
 void
 apply_board_config(tty_port_t *ports, int nports,
                    board_id_t *ids, int nids)
 {
+    /* Match keys in descending order of trustworthiness, so a precise pin
+     * elsewhere in the file always beats a volatile /dev path pin here.
+     * PIN_NONE keeps the "no match" case out of the ordering. */
+    enum { PIN_NONE = 0, PIN_DEV_PATH, PIN_USB_PATH, PIN_SERIAL };
+
     for (int i = 0; i < nports; i++) {
+        int best = PIN_NONE;
+        int best_j = -1;
+
         for (int j = 0; j < nids; j++) {
-            int match = 0, match_by_serial = 0;
-            /* match by serial number */
+            int kind = PIN_NONE;
+
             if (ids[j].serial[0] && ports[i].serial[0] &&
                 strcmp(ports[i].serial, ids[j].serial) == 0) {
-                match = 1;
-                match_by_serial = 1;
+                kind = PIN_SERIAL;
+            } else if (ids[j].usb_path[0] && !ids[j].serial[0] &&
+                       ports[i].usb_path[0] &&
+                       strcmp(ports[i].usb_path, ids[j].usb_path) == 0) {
+                /* Topology is a match key only for an entry that has no
+                 * serial. When a serial is present it is the entry's
+                 * identity and the "# USB:" value is just a human note on
+                 * where the board was last seen -- often months stale. A
+                 * stale note put NUCLEO-H563ZI's name on whichever STLINK
+                 * happened to occupy its old hub port. */
+                kind = PIN_USB_PATH;
+            } else if (ids[j].dev_path[0] &&
+                       strcmp(ports[i].dev_path, ids[j].dev_path) == 0) {
+                kind = PIN_DEV_PATH;
             }
-            /* match by device path */
-            if (ids[j].dev_path[0] &&
-                strcmp(ports[i].dev_path, ids[j].dev_path) == 0) {
-                match = 1;
-            }
-            if (match) {
-                /* For device-path-only matches, verify compatibility with
-                 * VID:PID.  Device paths are unstable and shift when devices
-                 * are added or removed, so a stale path can point to the
-                 * wrong device.  Serial-number matches are authoritative.
-                 * Skip this check when the board config has a custom baud
-                 * rate -- the user explicitly assigned this device path. */
-                if (!match_by_serial && ports[i].known &&
-                    ids[j].baud == 0) {
-                    int compat = 0;
-                    for (int b = 0; b < MAX_BOARDS_PER_DEVICE &&
-                                    ports[i].known->boards[b]; b++) {
-                        if (strcmp(ports[i].known->boards[b],
-                                  ids[j].board_name) == 0) {
-                            compat = 1;
-                            break;
-                        }
+
+            if (kind <= best)
+                continue;
+
+            /* A bare /dev path is the one key the kernel reuses: minor
+             * numbers are recycled, so a pin written months ago can land
+             * on an entirely unrelated board (a stale PL2303 pin was
+             * sitting on a FlashPro5 this way). Sanity-check it against
+             * the VID:PID's board list and say so when it fails, rather
+             * than skipping in silence. Serial and topology matches are
+             * precise and need no such check. */
+            if (kind == PIN_DEV_PATH && ports[i].known) {
+                int compat = 0;
+                for (int b = 0; b < MAX_BOARDS_PER_DEVICE &&
+                                ports[i].known->boards[b]; b++) {
+                    if (strcmp(ports[i].known->boards[b],
+                              ids[j].board_name) == 0) {
+                        compat = 1;
+                        break;
                     }
-                    if (!compat)
-                        continue;   /* stale path -- skip */
                 }
-                strlcpy_safe(ports[i].board_override, ids[j].board_name,
-                             sizeof(ports[i].board_override));
-                if (ids[j].baud > 0)
-                    ports[i].baud = ids[j].baud;
-                /* regenerate label with the board override */
-                get_device_label(&ports[i]);
-                break;
+                if (!compat) {
+                    warn_stale_pin_once(&ids[j], &ports[i]);
+                    continue;
+                }
             }
+
+            best = kind;
+            best_j = j;
+            if (best == PIN_SERIAL)
+                break;    /* nothing can outrank a serial match */
+        }
+
+        if (best_j >= 0) {
+            strlcpy_safe(ports[i].board_override, ids[best_j].board_name,
+                         sizeof(ports[i].board_override));
+            if (ids[best_j].baud > 0)
+                ports[i].baud = ids[best_j].baud;
+            /* regenerate label with the board override */
+            get_device_label(&ports[i]);
         }
     }
 }
@@ -1154,7 +1407,7 @@ print_port_table(device_group_t *groups, int ngroups, int verbose)
                      * the predicted-label path if it happens to exist */
                     char logpath[512];
                     snprintf(logpath, sizeof(logpath),
-                             LOG_BASE_DIR "/latest/%s.log", port->label);
+                             "%s/latest/%s.log", log_base_dir_path(), port->label);
                     if (access(logpath, F_OK) == 0)
                         printf("      Log: %s\n", logpath);
                 }
@@ -1163,7 +1416,7 @@ print_port_table(device_group_t *groups, int ngroups, int verbose)
                 char ptypath[512];
                 char ptytarget[256];
                 snprintf(ptypath, sizeof(ptypath),
-                         LOG_BASE_DIR "/pty/%s", port->label);
+                         "%s/pty/%s", log_base_dir_path(), port->label);
                 ssize_t len = readlink(ptypath, ptytarget,
                                        sizeof(ptytarget) - 1);
                 if (len > 0) {

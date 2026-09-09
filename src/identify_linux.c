@@ -33,33 +33,71 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Extract the USB bus path (e.g. "1-6.2") from a sysfs device path.
- * Looks for pattern /usbN/<path>/ in the resolved sysfs path. */
+/* Extract the USB device's topology path (e.g. "1-6.2") from a resolved
+ * sysfs path such as
+ *   /sys/devices/pci0000:00/0000:00:14.0/usb1/1-6/1-6.2/1-6.2:1.0/ttyUSB4
+ *
+ * Every USB device on the chain appears as a component under /usbN/, one
+ * per hub level, and the deepest of them names the device itself. Taking
+ * the FIRST component instead yields only the root-hub port ("1-6"), which
+ * every device behind that hub shares -- so a topology pin or a label
+ * disambiguator built on it would happily match an unrelated board on a
+ * neighbouring port. Interface components ("1-6.2:1.0") and the tty node
+ * are skipped: only digits, '-' and '.' can appear in a device path.
+ */
+static int
+is_usb_device_component(const char *s, size_t len)
+{
+    size_t i;
+
+    if (len == 0)
+        return 0;
+    for (i = 0; i < len; i++) {
+        if ((s[i] < '0' || s[i] > '9') && s[i] != '-' && s[i] != '.')
+            return 0;
+    }
+    return 1;
+}
+
 static void
 extract_usb_path(const char *sysfs_path, char *usb_path, size_t sz)
 {
-    usb_path[0] = '\0';
-    /* Find /usbN/ in the path, then grab the next path component */
     const char *p = sysfs_path;
+
+    usb_path[0] = '\0';
+
+    /* Find /usbN/ -- the start of the USB chain for this controller. */
     while ((p = strstr(p, "/usb")) != NULL) {
-        p += 4; /* skip "/usb" */
-        /* skip the bus number digit(s) */
-        while (*p >= '0' && *p <= '9') p++;
-        if (*p == '/') {
-            p++;
-            /* now p points to the USB device path like "1-6.2/..." */
-            const char *end = p;
-            /* USB path is digits, dashes, dots until next slash or colon */
-            while (*end && *end != '/' && *end != ':')
-                end++;
-            size_t len = (size_t)(end - p);
-            if (len > 0 && len < sz) {
-                memcpy(usb_path, p, len);
-                usb_path[len] = '\0';
-            }
-            return;
+        const char *q = p + 4; /* skip "/usb" */
+        const char *digits = q;
+        while (*q >= '0' && *q <= '9') q++;
+        if (q != digits && *q == '/') {
+            p = q + 1;
+            break;
         }
-        /* keep searching */
+        p = q;
+    }
+    if (p == NULL || *p == '\0')
+        return;
+
+    /* Walk the remaining components, keeping the deepest one that names a
+     * USB device rather than an interface or the tty node. */
+    while (*p != '\0') {
+        const char *end = p;
+        size_t len;
+
+        while (*end != '\0' && *end != '/')
+            end++;
+        len = (size_t)(end - p);
+
+        if (is_usb_device_component(p, len) && len < sz) {
+            memcpy(usb_path, p, len);
+            usb_path[len] = '\0';
+        }
+
+        if (*end == '\0')
+            break;
+        p = end + 1;
     }
 }
 
